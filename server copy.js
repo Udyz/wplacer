@@ -1,0 +1,5263 @@
+import 'dotenv/config';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
+import { spawn, exec } from "node:child_process";
+import path from "node:path";
+import express from "express";
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import cors from "cors";
+import { CookieJar } from "tough-cookie";
+import { Impit } from "impit";
+import { Image, createCanvas, loadImage } from "canvas";
+import { initPawtect, setUserId, requestUrl, getPawtectedEndpointPayload } from './pawtect/pawtect.js';
+import { PNG } from "pngjs";
+
+// --- Setup __dirname for ES modules ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// --- Setup Data Directory ---
+const dataDir = "./data";
+if (!existsSync(dataDir)) {
+  mkdirSync(dataDir, { recursive: true });
+}
+// --- init pawtect ---
+let __pawtectWasm = null;
+let __pawtectInitPromise = null;
+async function getPawtectWasm() {
+  if (__pawtectWasm) return __pawtectWasm;
+  if (!__pawtectInitPromise) __pawtectInitPromise = initPawtect().then(w => (__pawtectWasm = w));
+  return __pawtectInitPromise;
+}
+
+// Heat maps directory
+const heatMapsDir = path.join(dataDir, "heat_maps");
+if (!existsSync(heatMapsDir)) {
+  try { mkdirSync(heatMapsDir, { recursive: true }); } catch (_) { }
+}
+
+// Backups directories
+const backupsRootDir = path.join(dataDir, "backups");
+const usersBackupsDir = path.join(backupsRootDir, "users");
+const proxiesBackupsDir = path.join(backupsRootDir, "proxies");
+try { if (!existsSync(backupsRootDir)) mkdirSync(backupsRootDir, { recursive: true }); } catch (_) { }
+try { if (!existsSync(usersBackupsDir)) mkdirSync(usersBackupsDir, { recursive: true }); } catch (_) { }
+try { if (!existsSync(proxiesBackupsDir)) mkdirSync(proxiesBackupsDir, { recursive: true }); } catch (_) { }
+
+// --- Grief Monitoring ---
+let griefers = [];
+let griefCheckJob = { active: false, lastCheck: 0, checkInterval: 30000 }; // 30s interval
+let checkedGriefs = new Set(); // Track already checked griefs to avoid duplicates
+let templateNoFindsCount = new Map(); // Track consecutive no-find batches per template
+let existingGriefLocations = new Set(); // Track lat_lng to avoid rechecking saved griefers
+let isWaiting = false;
+// Load griefers and history from unified file
+function loadGriefersFromFile() {
+  try {
+    const griefersFile = path.join(__dirname, 'data', 'griefers.json');
+    if (existsSync(griefersFile)) {
+      const data = JSON.parse(readFileSync(griefersFile, 'utf8'));
+      
+      // Handle both old format (array) and new format (object)
+      if (Array.isArray(data)) {
+        // Old format - only griefers array
+        griefers = data || [];
+        log("SYSTEM", "grief-monitor", `📂 Loaded ${griefers.length} griefers from file (old format)`);
+      } else {
+        // New format - unified object
+        griefers = data.griefers || [];
+        try {
+          existingGriefLocations = new Set(
+            griefers
+              .filter(g => typeof g.lat === 'number' && typeof g.lng === 'number')
+              .map(g => `${g.lat.toFixed(6)}_${g.lng.toFixed(6)}`)
+          );
+        } catch (_) { existingGriefLocations = new Set(); }
+        log("SYSTEM", "grief-monitor", `📂 Loaded ${griefers.length} griefers from file; seeded ${existingGriefLocations.size} locations`);
+      }
+    }
+  } catch (error) {
+    log("SYSTEM", "grief-monitor", `❌ Failed to load griefers: ${error.message}`);
+  }
+}
+
+// Save griefers and history to unified file
+function saveGriefersToFile() {
+  try {
+    const griefersFile = path.join(__dirname, 'data', 'griefers.json');
+    const data = {
+      griefers: griefers
+    };
+    writeFileSync(griefersFile, JSON.stringify(data, null, 2));
+  } catch (error) {
+    log("SYSTEM", "grief-monitor", `❌ Failed to save griefers: ${error.message}`);
+  }
+}
+
+// Coordinate conversion function (from find.js)
+function backendTilePixelToLatLng_center(tileX, tileY, pixelX, pixelY, opts = {}) {
+  const TILE_SIZE = opts.tileSize ?? 1000;
+  const CANONICAL_Z = opts.canonicalZ ?? 11;
+  const WORLD_PIXELS = TILE_SIZE * Math.pow(2, CANONICAL_Z);
+  const globalX = tileX * TILE_SIZE + pixelX + 0.5;
+  const globalY = tileY * TILE_SIZE + pixelY + 0.5;
+  
+  const xNorm = globalX / WORLD_PIXELS;
+  const yNorm = globalY / WORLD_PIXELS;
+  
+  const lng = xNorm * 360 - 180;
+  const lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * yNorm))) * 180 / Math.PI;
+  
+  return { lat, lon: lng, zoom: (CANONICAL_Z + Math.floor(Math.random() * (10 - 7 + 1)) + 7) + Math.random().toFixed(15).slice(1) };
+}
+
+// Grief detection functions (from find.js)
+async function fetchTile(tileX, tileY) {
+  try {
+    const browser = new Impit({ browser: "chrome", ignoreTlsErrors: true });
+    const url = `https://bplace.org/files/s0/tiles/${tileX}/${tileY}.png?t=${Date.now()}`;
+    const response = await browser.fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'image/png,image/*,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'image',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'cross-site',
+        'Cache-Control': 'max-age=0'
+      }
+    });
+    
+    if (response.ok) {
+      return Buffer.from(await response.arrayBuffer());
+    }
+  } catch (error) {
+    // Silent fail for grief detection
+  }
+  return null;
+}
+
+function parseTileData(buffer) {
+  const png = PNG.sync.read(buffer);
+  const w = png.width, h = png.height, d = png.data;
+  const data = new Array(1000).fill(null).map(() => new Array(1000).fill(0));
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) {
+      const i = (y * w + x) * 4;
+      const r = d[i], g = d[i+1], b = d[i+2], a = d[i+3];
+      data[x][y] = a === 255 ? (pallete[`${r},${g},${b}`] || 0) : 0;
+    }
+  }
+  return data;
+}
+
+async function fetchUser(tileX, tileY, pixelX, pixelY) {
+  const browser = new Impit({ browser: "chrome", ignoreTlsErrors: true });
+  let retry = 0;
+  const url = `https://bplace.org/s0/pixel/${tileX}/${tileY}?x=${pixelX}&y=${pixelY}`;
+  try {
+    const headers = {
+      "accept": "*/*",
+      "accept-language": "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5,zh-CN;q=0.4,zh;q=0.3,fa;q=0.2",
+      "priority": "u=1, i",
+      "sec-ch-ua": "\"Not;A=Brand\";v=\"99\", \"Google Chrome\";v=\"139\", \"Chromium\";v=\"139\"",
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": "\"Windows\"",
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-site",
+      "Referer": "https://bplace.org/"
+    };
+    
+    const response = await browser.fetch(url, { headers });
+    if (!response.ok) {
+      retry++;
+      if (retry < 3) {
+        return fetchUser(tileX, tileY, pixelX, pixelY);
+      }
+      return null;
+    }
+    const data = await response.json();
+    return data.paintedBy || null;
+  } catch (error) {
+    // Silent fail for grief detection
+    retry++;
+    if (retry < 3) {
+      return fetchUser(tileX, tileY, pixelX, pixelY);
+    }
+  }
+  return null;
+}
+
+async function loadTilesForTemplate(template, coords) {
+  const [startX, startY, startPx, startPy] = coords;
+  const tiles = new Map();
+  
+  // Get template dimensions from template.template object
+  const templateWidth = template.template?.width || template.width;
+  const templateHeight = template.template?.height || template.height;
+  
+  if (!templateWidth || !templateHeight) {
+    return tiles;
+  }
+  
+  // Tính tile range
+  const endPx = startPx + templateWidth - 1;
+  const endPy = startPy + templateHeight - 1;
+  const startTx = startX + Math.floor(startPx / 1000);
+  const startTy = startY + Math.floor(startPy / 1000);
+  const endTx = startX + Math.floor(endPx / 1000);
+  const endTy = startY + Math.floor(endPy / 1000);
+  
+  // Tải tất cả tiles cần thiết
+  for (let tx = startTx; tx <= endTx; tx++) {
+    for (let ty = startTy; ty <= endTy; ty++) {
+      const buffer = await fetchTile(tx, ty);
+      if (buffer) {
+        const data = parseTileData(buffer);
+        tiles.set(`${tx}_${ty}`, { data });
+      }
+    }
+  }
+  
+  return tiles;
+}
+
+async function checkGriefersInTemplate(templateId, templateData, sampleLimit = 10) {
+  if (!currentSettings.griefMonitoringEnabled || !templateData.coords) return;
+  
+  try {    
+    const [startX, startY, startPx, startPy] = templateData.coords;
+    
+    // Load tiles for this template
+    const tiles = await loadTilesForTemplate(templateData, templateData.coords);
+    if (tiles.size === 0) {
+      return;
+    }
+    
+    // Get template data
+    const template = templateData.template || templateData;
+    const templateWidth = template.width;
+    const templateHeight = template.height;
+    const templateDataArray = template.data;
+    
+    if (!templateDataArray || !templateWidth || !templateHeight) {
+      log("SYSTEM", "grief-monitor", `❌ Invalid template data: width=${templateWidth}, height=${templateHeight}, hasData=${!!templateDataArray}`);
+      return;
+    }
+    
+    // Always rebuild mismatches from tiles (no cache)
+    const mismatched = [];
+    let checkedPixels = 0;
+    let foundMismatches = 0;
+    let skippedUnpainted = 0;
+    for (let y = 0; y < templateHeight; y++) {
+      for (let x = 0; x < templateWidth; x++) {
+        const templateColor = templateDataArray[x] && templateDataArray[x][y];
+        if (templateColor == null || templateColor === 0) continue;
+        checkedPixels++;
+        const globalPx = startPx + x;
+        const globalPy = startPy + y;
+        const targetTx = startX + Math.floor(globalPx / 1000);
+        const targetTy = startY + Math.floor(globalPy / 1000);
+        const localPx = globalPx % 1000;
+        const localPy = globalPy % 1000;
+        const tile = tiles.get(`${targetTx}_${targetTy}`);
+        if (!tile || !tile.data[localPx]) { skippedUnpainted++; continue; }
+        const tileColor = tile.data[localPx][localPy];
+        if (tileColor !== 0 && templateColor !== tileColor) {
+          foundMismatches++;
+          mismatched.push({ tx: targetTx, ty: targetTy, px: localPx, py: localPy, expectedColor: templateColor, actualColor: tileColor, globalX: globalPx, globalY: globalPy, griefType: 'wrong_color', lastChecked: Date.now() });
+        }
+      }
+    }
+    
+    // Filter out griefs checked more than 1 hour ago to avoid rate limit
+    const oneHourAgo = Date.now() - (60 * 60 * 1000); // 1 hour in milliseconds
+    const recentMismatched = mismatched.filter(grief => {
+      return !grief.lastChecked || grief.lastChecked > oneHourAgo;
+    });
+    
+    if (recentMismatched.length < mismatched.length) {
+      log("SYSTEM", "grief-monitor", `⏰ Filtered out ${mismatched.length - recentMismatched.length} old griefs (>1h) to avoid rate limit`);
+      mismatched = recentMismatched;
+      log("SYSTEM", "grief-monitor", `📊 Stored ${mismatched.length} mismatched pixels for template ${templateData.name}`);
+    }
+    // Process mismatches (limit based on sampleLimit parameter)
+    let newGriefsFound = 0;
+    let limit = sampleLimit;
+  
+    for (const mismatch of mismatched) {
+      // log("SYSTEM", "DEBUG", `🔍 Checking mismatch: ${mismatch.tx}/${mismatch.ty}@${mismatch.px},${mismatch.py}`);
+      // Create unique key for this grief location
+      const griefKey = `${mismatch.tx}_${mismatch.ty}_${mismatch.px}_${mismatch.py}`;
+      
+      // Skip if already checked this grief
+      // Skip if already checked or already saved as a griefer at same lat/lng
+      if (checkedGriefs.has(griefKey)) {
+        continue;
+      }
+      if (limit <= 0) break;
+      limit--;
+      const user = await fetchUser(mismatch.tx, mismatch.ty, mismatch.px, mismatch.py);
+      // log("SYSTEM", "DEBUG", JSON.stringify(user));
+      // Update lastChecked timestamp for this grief
+      mismatch.lastChecked = Date.now();
+      
+      if (user) {
+        const { lat, lon, zoom } = backendTilePixelToLatLng_center(mismatch.tx, mismatch.ty, mismatch.px, mismatch.py);
+        const locKey = `${lat.toFixed(6)}_${lon.toFixed(6)}`;
+        if (existingGriefLocations.has(locKey)) {
+          checkedGriefs.add(griefKey);
+          continue;
+        }
+        
+        // Check if this specific grief location already exists
+        const existingGrief = griefers.find(g => 
+          g.id === user.id && 
+          g.name === user.name && 
+          g.lat === lat && 
+          g.lng === lon
+        );
+        if (existingGrief) {
+          checkedGriefs.add(griefKey); // Mark as checked even if duplicate location
+          continue; // Skip duplicate location
+        }
+        const grieferData = {
+          name: user.name,
+          id: user.id,
+          alliance: user.allianceName || '-',
+          url: `https://bplace.org/?lat=${lat}&lng=${lon}&zoom=${zoom}`,
+          lat: lat,
+          lng: lon, // Keep lng for frontend compatibility
+          griefType: mismatch.griefType,
+          timestamp: Date.now(),
+          detectedAt: new Date().toISOString(), // Frontend expects this field
+          templateId: templateId,
+          templateName: templateData.name
+        };
+        if (isWaiting) isWaiting = false;
+        griefers.push(grieferData);
+        try { existingGriefLocations.add(locKey); } catch (_) {}
+        checkedGriefs.add(griefKey); // Mark this grief as checked
+        newGriefsFound++;
+        saveGriefersToFile(); // Save to file
+        log("SYSTEM", "grief-monitor", `🚨 Griefer detected: ${user.name}#${user.id} at ${lat},${lon}`);
+      } else {
+        // No user found: do not mark as checked so we can retry later
+      }
+      
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, Math.random() * 1000 + 2000));
+    }
+    
+    // No template history to update
+    
+    if (newGriefsFound > 0) {
+      try { templateNoFindsCount.set(String(templateId), 0); } catch (_) {}
+      griefCheckJob.checkInterval = 7000;
+    } else {
+      if(isWaiting) {
+        return;
+      }
+      const tKey = String(templateId);
+      const prev = Number(templateNoFindsCount.get(tKey) || 0);
+      const next = prev + 1;
+      templateNoFindsCount.set(tKey, next);
+      if (next >= 3) {
+        const currentDelay = griefCheckJob.checkInterval;
+        if (currentDelay < 600000) {
+          griefCheckJob.checkInterval = Math.min(currentDelay * 23.2, 600000);
+          log("SYSTEM", "grief-monitor", `⏰ No new griefers found (x${next}), increased check interval to ${Math.round(griefCheckJob.checkInterval/1000)}s`);
+          isWaiting=true;
+        }
+      }
+    }
+  } catch (error) {
+    log("SYSTEM", "grief-monitor", `❌ Error checking griefers: ${error.message}`);
+  }
+}
+// Background grief monitoring job
+async function startGriefMonitoring() {
+  if (griefCheckJob.active) return;
+  
+  griefCheckJob.active = true;
+  log("SYSTEM", "grief-monitor", "🔍 Starting grief monitoring background job");
+  
+  while (currentSettings.griefMonitoringEnabled) {
+    try {
+      const now = Date.now();
+      if (now - griefCheckJob.lastCheck >= griefCheckJob.checkInterval) {
+        griefCheckJob.lastCheck = now;
+        
+        // Check templates only when they are "Waiting for charges" to avoid rate limiting during painting
+        const activeTemplates = Object.entries(templates).filter(([_, data]) => 
+          data.status && data.status.includes("Waiting for charges")
+        );
+                
+        for (const [templateId, templateData] of activeTemplates) {
+          await checkGriefersInTemplate(templateId, templateData, 10);
+        }
+        
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5s
+    } catch (error) {
+      log("SYSTEM", "grief-monitor", `❌ Grief monitoring error: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10s on error
+    }
+  }
+  
+  griefCheckJob.active = false;
+  log("SYSTEM", "grief-monitor", "⏹️ Grief monitoring stopped");
+}
+
+// --- Live log streaming (SSE) ---
+const sseClients = [];
+const broadcastLog = (payload) => {
+  try {
+    const data = `data: ${JSON.stringify(payload)}\n\n`;
+    for (let i = sseClients.length - 1; i >= 0; i--) {
+      const res = sseClients[i];
+      try { res.write(data); } catch { sseClients.splice(i, 1); }
+    }
+  } catch (_) { }
+};
+
+// Keep recent logs in memory for this process session
+const RECENT_LOGS_LIMIT = 5000;
+const recentLogs = [];
+
+// Helper function to add messages to Live Logs
+const addToLiveLogs = (message, category = 'general', level = 'info') => {
+  try {
+    const obj = { line: message, category, level, ts: new Date().toLocaleString() };
+    recentLogs.push(obj); 
+    if (recentLogs.length > RECENT_LOGS_LIMIT) recentLogs.shift();
+    broadcastLog(obj);
+  } catch (_) { }
+};
+
+// Track open sockets to allow forced shutdown
+const sockets = new Set();
+
+// --- Logging & utils ---
+const log = async (id, name, data, error) => {
+  const timestamp = new Date().toLocaleString();
+  const identifier = `(${name}#${id})`;
+  const maskOn = !!(currentSettings && currentSettings.logMaskPii);
+  const maskMsg = (msg) => {
+    try {
+      let s = String(msg || "");
+      // (nick#123456) -> (****#****)
+      s = s.replace(/\([^)#]+#\d+\)/g, '(****#****)');
+      // #11240474 -> #**** (for 3+ digits)
+      s = s.replace(/#\d{3,}/g, '#****');
+      // tile 1227, 674 -> tile ****, ****
+      s = s.replace(/tile\s+\d+\s*,\s*\d+/gi, 'tile ****, ****');
+      return s;
+    } catch (_) { return String(msg || ""); }
+  };
+  if (error) {
+    const identOut = maskOn ? maskMsg(identifier) : identifier;
+    const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}:`;
+    console.error(outLine, error);
+    const errText = `${error.stack || error.message}`;
+    appendFileSync(path.join(dataDir, `errors.log`), `${outLine} ${maskOn ? maskMsg(errText) : errText}\n`);
+    try {
+      const obj = { line: `${outLine} ${maskOn ? maskMsg(errText) : errText}`, category: "error", level: "error", ts: timestamp };
+      recentLogs.push(obj); if (recentLogs.length > RECENT_LOGS_LIMIT) recentLogs.shift();
+      broadcastLog(obj);
+    } catch (_) { }
+  } else {
+    try {
+      // Category-based filtering (non-error logs only)
+      const cat = (() => {
+        const s = String(data || "").toLowerCase();
+        if (s.includes('token_manager')) return 'tokenManager';
+        if (s.includes('cache')) return 'cache';
+        if (s.includes('queue') && s.includes('preview')) return 'queuePreview';
+        if (s.includes('🧱 painting') || s.includes(' painting (')) return 'painting';
+        if (s.includes('start turn')) return 'startTurn';
+        if (s.includes('mismatched')) return 'mismatches';
+        if (s.includes('estimated time')) return 'estimatedTime';
+        return null;
+      })();
+      const cfg = (currentSettings && currentSettings.logCategories) || {};
+      const enabled = (cat == null) ? true : (cfg[cat] !== false);
+      if (!enabled) return; // skip suppressed category
+      const identOut = maskOn ? maskMsg(identifier) : identifier;
+      const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}`;
+      console.log(outLine);
+      appendFileSync(path.join(dataDir, `logs.log`), `${outLine}\n`);
+      try {
+        const obj = { line: outLine, category: cat || 'general', level: 'info', ts: timestamp };
+        recentLogs.push(obj); if (recentLogs.length > RECENT_LOGS_LIMIT) recentLogs.shift();
+        broadcastLog(obj);
+      } catch (_) { }
+    } catch (_) {
+      const identOut = maskOn ? maskMsg(identifier) : identifier;
+      const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}`;
+      console.log(outLine);
+      appendFileSync(path.join(dataDir, `logs.log`), `${outLine}\n`);
+      try {
+        const obj = { line: outLine, category: 'general', level: 'info', ts: timestamp };
+        recentLogs.push(obj); if (recentLogs.length > RECENT_LOGS_LIMIT) recentLogs.shift();
+        broadcastLog(obj);
+      } catch (_) { }
+    }
+  }
+};
+
+
+
+const duration = (durationMs) => {
+  if (durationMs <= 0) return "0s";
+  const totalSeconds = Math.floor(durationMs / 1000);
+  const seconds = totalSeconds % 60;
+  const minutes = Math.floor(totalSeconds / 60) % 60;
+  const hours = Math.floor(totalSeconds / 3600);
+  const parts = [];
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  if (seconds || parts.length === 0) parts.push(`${seconds}s`);
+  return parts.join(" ");
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// --- Colors / Palette (same as both versions) ---
+const basic_colors = { "0,0,0": 1, "60,60,60": 2, "120,120,120": 3, "210,210,210": 4, "255,255,255": 5, "96,0,24": 6, "237,28,36": 7, "255,127,39": 8, "246,170,9": 9, "249,221,59": 10, "255,250,188": 11, "14,185,104": 12, "19,230,123": 13, "135,255,94": 14, "12,129,110": 15, "16,174,166": 16, "19,225,190": 17, "40,80,158": 18, "64,147,228": 19, "96,247,242": 20, "107,80,246": 21, "153,177,251": 22, "120,12,153": 23, "170,56,185": 24, "224,159,249": 25, "203,0,122": 26, "236,31,128": 27, "243,141,169": 28, "104,70,52": 29, "149,104,42": 30, "248,178,119": 31 };
+const premium_colors = { "170,170,170": 32, "165,14,30": 33, "250,128,114": 34, "228,92,26": 35, "214,181,148": 36, "156,132,49": 37, "197,173,49": 38, "232,212,95": 39, "74,107,58": 40, "90,148,74": 41, "132,197,115": 42, "15,121,159": 43, "187,250,242": 44, "125,199,255": 45, "77,49,184": 46, "74,66,132": 47, "122,113,196": 48, "181,174,241": 49, "219,164,99": 50, "209,128,81": 51, "255,197,165": 52, "155,82,73": 53, "209,128,120": 54, "250,182,164": 55, "123,99,82": 56, "156,132,107": 57, "51,57,65": 58, "109,117,141": 59, "179,185,209": 60, "109,100,63": 61, "148,140,107": 62, "205,197,158": 63 };
+const pallete = { ...basic_colors, ...premium_colors };
+const colorBitmapShift = Object.keys(basic_colors).length + 1;
+
+// --- Charge cache (avoid logging in all users each cycle) ---
+const ChargeCache = {
+  _m: new Map(),
+  REGEN_MS: 30_000,
+  SYNC_MS: 8 * 60_000,
+  _key(id) { return String(id); },
+
+  has(id) { return this._m.has(this._key(id)); },
+  stale(id, now = Date.now()) {
+    const u = this._m.get(this._key(id)); if (!u) return true;
+    return (now - u.lastSync) > this.SYNC_MS;
+  },
+  markFromUserInfo(userInfo, now = Date.now()) {
+    if (!userInfo?.id || !userInfo?.charges) return;
+    const k = this._key(userInfo.id);
+    const base = Math.floor(userInfo.charges.count ?? 0);
+    const max = Math.floor(userInfo.charges.max ?? 0);
+    this._m.set(k, { base, max, lastSync: now });
+  },
+  predict(id, now = Date.now()) {
+    const u = this._m.get(this._key(id)); if (!u) return null;
+    const grown = Math.floor((now - u.lastSync) / this.REGEN_MS);
+    const count = Math.min(u.max, u.base + Math.max(0, grown));
+    return { count, max: u.max, cooldownMs: this.REGEN_MS };
+  },
+  consume(id, n = 1, now = Date.now()) {
+    const k = this._key(id);
+    const u = this._m.get(k); if (!u) return;
+    const grown = Math.floor((now - u.lastSync) / this.REGEN_MS);
+    const avail = Math.min(u.max, u.base + Math.max(0, grown));
+    const newCount = Math.max(0, avail - n);
+    u.base = newCount;
+    u.lastSync = now - ((now - u.lastSync) % this.REGEN_MS);
+    this._m.set(k, u);
+  }
+};
+
+let loadedProxies = [];
+// map: proxy idx -> timestamp (ms) until which proxy is quarantined (skipped)
+const proxyQuarantine = new Map();
+const loadProxies = () => {
+  const proxyPath = path.join(dataDir, "proxies.txt");
+  if (!existsSync(proxyPath)) {
+    writeFileSync(proxyPath, "");
+    console.log("[SYSTEM] `data/proxies.txt` not found, created an empty one.");
+    loadedProxies = [];
+    return;
+  }
+
+  const raw = readFileSync(proxyPath, "utf8");
+  const lines = raw
+    .split(/\r?\n/)
+    .map(l => l.replace(/\s+#.*$|\s+\/\/.*$|^\s*#.*$|^\s*\/\/.*$/g, '').trim())
+    .filter(Boolean);
+
+  const protoMap = new Map([
+    ["http", "http"],
+    ["https", "https"],
+    ["socks4", "socks4"],
+    ["socks5", "socks5"]
+  ]);
+
+  const inRange = p => Number.isInteger(p) && p >= 1 && p <= 65535;
+  const looksHostname = host => {
+    if (!host || typeof host !== "string") return false;
+    // IPv4
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(host)) return true;
+    // Domain
+    if (/^[a-zA-Z0-9.-]+$/.test(host)) return true;
+    // allow IPv6 content (without brackets) as a last resort
+    if (/^[0-9a-fA-F:]+$/.test(host)) return true;
+    return false;
+  };
+
+  const parseOne = line => {
+    // url-like: scheme://user:pass@host:port
+    const urlLike = line.match(/^(\w+):\/\//);
+    if (urlLike) {
+      const scheme = urlLike[1].toLowerCase();
+      const protocol = protoMap.get(scheme);
+      if (!protocol) return null;
+      try {
+        const u = new URL(line);
+        const host = u.hostname;
+        const port = u.port ? parseInt(u.port, 10) : NaN;
+        const username = decodeURIComponent(u.username || "");
+        const password = decodeURIComponent(u.password || "");
+        if (!looksHostname(host) || !inRange(port)) return null;
+        return { protocol, host, port, username, password };
+      } catch {
+        return null;
+      }
+    }
+
+    // user:pass@host:port (host may be [ipv6])
+    const authHost = line.match(/^([^:@\s]+):([^@\s]+)@(.+)$/);
+    if (authHost) {
+      const username = authHost[1];
+      const password = authHost[2];
+      const rest = authHost[3];
+      const m6 = rest.match(/^\[([^\]]+)\]:(\d+)$/);
+      const m4 = rest.match(/^([^:\s]+):(\d+)$/);
+      let host = '';
+      let port = NaN;
+      if (m6) {
+        host = m6[1];
+        port = parseInt(m6[2], 10);
+      } else if (m4) {
+        host = m4[1];
+        port = parseInt(m4[2], 10);
+      } else return null;
+      if (!looksHostname(host) || !inRange(port)) return null;
+      return { protocol: 'http', host, port, username, password };
+    }
+
+    // [ipv6]:port
+    const bare6 = line.match(/^\[([^\]]+)\]:(\d+)$/);
+    if (bare6) {
+      const host = bare6[1];
+      const port = parseInt(bare6[2], 10);
+      if (!inRange(port)) return null;
+      return { protocol: 'http', host, port, username: '', password: '' };
+    }
+
+    // host:port
+    const bare = line.match(/^([^:\s]+):(\d+)$/);
+    if (bare) {
+      const host = bare[1];
+      const port = parseInt(bare[2], 10);
+      if (!looksHostname(host) || !inRange(port)) return null;
+      return { protocol: 'http', host, port, username: '', password: '' };
+    }
+
+    // user:pass:host:port
+    const uphp = line.split(":");
+    if (uphp.length === 4 && /^\d+$/.test(uphp[3])) {
+      const [username, password, host, portStr] = uphp;
+      const port = parseInt(portStr, 10);
+      if (looksHostname(host) && inRange(port)) return { protocol: 'http', host, port, username, password };
+    }
+
+    return null;
+  };
+
+  const seen = new Set();
+  const proxies = [];
+  for (const line of lines) {
+    const p = parseOne(line);
+    if (!p) {
+      console.log(`[SYSTEM] WARNING: Invalid proxy format skipped: "${line}" - expected format: http://ip:port or user:pass@ip:port`);
+      continue;
+    }
+    const key = `${p.protocol}://${p.username}:${p.password}@${p.host}:${p.port}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // Assign 1-based index corresponding to order in proxies.txt after filtering
+    proxies.push({ ...p, _idx: proxies.length + 1 });
+  }
+  loadedProxies = proxies;
+  if (lines.length > 0 && proxies.length === 0) {
+    console.log(`[SYSTEM] ERROR: No valid proxies loaded from ${lines.length} lines - check proxies.txt format`);
+  }
+  // Reset quarantine on reload to avoid mismatched indices after edits
+  try { proxyQuarantine.clear(); } catch (_) { }
+};
+
+let nextProxyIndex = 0;
+const getNextProxy = () => {
+  const { proxyEnabled, proxyRotationMode } = currentSettings || {};
+  if (!proxyEnabled || loadedProxies.length === 0) return null;
+  const now = Date.now();
+  const isUsable = (p) => {
+    const index = Number(p._idx) || (loadedProxies.indexOf(p) + 1);
+    const until = proxyQuarantine.get(index) || 0;
+    return until <= now;
+  };
+
+  const buildSel = (p) => {
+    let proxyUrl = `${p.protocol}://`;
+    if (p.username && p.password) {
+      proxyUrl += `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@`;
+    }
+    proxyUrl += `${p.host}:${p.port}`;
+    const display = `${p.host}:${p.port}`;
+    const index = Number(p._idx) || (loadedProxies.indexOf(p) + 1);
+    return { url: proxyUrl, idx: index, display };
+  };
+
+  // Try up to N attempts to find a non-quarantined proxy
+  const maxAttempts = loadedProxies.length;
+  if (proxyRotationMode === "random") {
+    for (let i = 0; i < maxAttempts; i++) {
+      const randomIndex = Math.floor(Math.random() * loadedProxies.length);
+      const proxy = loadedProxies[randomIndex];
+      if (isUsable(proxy)) return buildSel(proxy);
+    }
+  } else {
+    for (let i = 0; i < maxAttempts; i++) {
+      const proxy = loadedProxies[nextProxyIndex];
+      nextProxyIndex = (nextProxyIndex + 1) % loadedProxies.length;
+      if (isUsable(proxy)) return buildSel(proxy);
+    }
+  }
+  return null;
+};
+
+const quarantineProxy = (idx, minutes = 15, reason = "") => {
+  try {
+    const ms = Math.max(1, Math.floor(Number(minutes))) * 60 * 1000;
+    const until = Date.now() + ms;
+    proxyQuarantine.set(idx, until);
+    const p = loadedProxies.find(x => (Number(x._idx) || (loadedProxies.indexOf(x) + 1)) === idx);
+    const label = p ? `${p.host}:${p.port}` : `#${idx}`;
+    log("SYSTEM", "wplacer", `🧯 Quarantining proxy #${idx} (${label}) for ${Math.floor(ms / 60000)}m${reason ? ` — ${reason}` : ''}`);
+  } catch (_) { }
+};
+
+
+// --- Suspension error (kept from new version) ---
+class SuspensionError extends Error {
+  constructor(message, durationMs) {
+    super(message);
+    this.name = "SuspensionError";
+    this.durationMs = durationMs;
+    this.suspendedUntil = Date.now() + durationMs;
+  }
+}
+
+// --- WPlacer with old painting modes ported over ---
+class WPlacer {
+  constructor(template, coords, settings, templateName, paintTransparentPixels = false, initialBurstSeeds = null, skipPaintedPixels = false, outlineMode = false) {
+    this.template = template;
+    this.templateName = templateName;
+    this.coords = coords;
+    this.settings = settings;
+    this.paintTransparentPixels = !!paintTransparentPixels;
+
+    this.skipPaintedPixels = !!skipPaintedPixels;
+    this.outlineMode = !!outlineMode;
+
+    this.cookies = null;
+    this.browser = null;
+    this.userInfo = null;
+    this.tiles = new Map();
+    this.token = 'skip';
+    this.pawtect = null;
+    this.pawtectVariant = null;
+    this._lastTilesAt = 0;
+
+    // burst seeds persistence
+    this._burstSeeds = Array.isArray(initialBurstSeeds) ? initialBurstSeeds.map(s => ({ gx: s.gx, gy: s.gy })) : null;
+    this._activeBurstSeedIdx = null;
+  }
+
+  // Add lightweight cancellation helper that can be set by TemplateManager
+  _isCancelled() {
+    try { return typeof this.shouldStop === 'function' ? !!this.shouldStop() : false; } catch (_) { return false; }
+  }
+
+  async login(cookies) {
+    this.cookies = cookies;
+    const jar = new CookieJar();
+    // jar.setCookieSync("cf_clearance=Z5sMXVChXiI5It4vOc4u_czRijQ4QwKdO3NRcIhrHmY-1758997225-1.2.1.1-rvYYMJExMZ_Sk0EEbWwkE7l2ceMacSN0w_K.DslhK.BxSOQ8f2GujfyA.h769eDKZdDQNislZKbmzBWumGVKi9ChjWAPyRXwOgfZScEBsn1WA87lzc8FsxSpbBKhz_UWLQi6jbXaEYUm0RnLEtGqpEPEUw6R46hu7OYavuNktWTcnoONTin9kXPGv_TU.H6vmDJWQQp3PdWYBr2U3IIbcXbPp3WIqHUCXUp5rowTJIk; Path=/; Secure; SameSite=Lax", "https://bplace.org")
+    for (const cookie of Object.keys(this.cookies)) {
+      const value = `${cookie}=${this.cookies[cookie]}; Path=/`;
+      jar.setCookieSync(value, "https://bplace.org");
+    }
+    const impitOptions = { cookieJar: jar, browser: "chrome", ignoreTlsErrors: true };
+    const proxySel = getNextProxy();
+    if (proxySel) {
+      impitOptions.proxyUrl = proxySel.url;
+      if (currentSettings.logProxyUsage) {
+        log("SYSTEM", "wplacer", `Using proxy #${proxySel.idx}: ${proxySel.display}`);
+      }
+      try { this._lastProxyIdx = proxySel.idx; } catch (_) { }
+    } else if (currentSettings.proxyEnabled && loadedProxies.length === 0) {
+      log("SYSTEM", "wplacer", `⚠️ Proxy enabled but no valid proxies loaded - check proxies.txt format`);
+    }
+    this.browser = new Impit(impitOptions);
+    await this.loadUserInfo();
+    return this.userInfo;
+  }
+
+  async loadUserInfo() {
+    const url = "https://bplace.org/me";
+    const me = await this.browser.fetch(url, {
+      headers: {
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://bplace.org/",
+        "Origin": "https://bplace.org",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site"
+      },
+      redirect: "manual"
+    });
+    const status = me.status;
+    const contentType = (me.headers.get("content-type") || "").toLowerCase();
+    const bodyText = await me.text();
+    const short = bodyText.substring(0, 200);
+    if (status === 429) {
+      throw new Error("❌ Rate limited (429) - waiting before retry");
+    }
+    if (status === 502) {
+      throw new Error(`❌ Server temporarily unavailable (502) - retrying later`);
+    }
+    if (status >= 300 && status < 400) {
+      const loc = me.headers.get('location') || '';
+      throw new Error(`❌ Unexpected redirect (${status})${loc ? ` to ${loc}` : ''}. Likely cookies invalid or blocked by proxy.`);
+    }
+    if (status === 401 || status === 403) {
+      if (/cloudflare|attention required|access denied|just a moment|cf-ray|challenge-form|cf-chl/i.test(bodyText)) {
+        // auto-quarantine proxy for a short time to reduce repeated blocks
+        try { if (typeof this._lastProxyIdx === 'number') quarantineProxy(this._lastProxyIdx, 20, `cloudflare_block_${status}`); } catch (_) { }
+        throw new Error(`❌ Cloudflare blocked the request.`);
+      }
+      if (contentType.includes("application/json")) {
+        try {
+          const json = JSON.parse(bodyText);
+          if (json?.error) {
+            throw new Error(`❌ Authentication failed (${status}): ${String(json.error).slice(0, 180)}...`);
+          }
+        } catch (_) {
+          // fall through to generic with snippet
+        }
+      }
+      throw new Error(`Authentication failed (${status}). Response: "${short}..."`);
+    }
+    if (contentType.includes("application/json")) {
+      let userInfo;
+      try {
+        userInfo = JSON.parse(bodyText);
+      } catch {
+        throw new Error(`❌ Failed to parse JSON from /me (status ${status}).`);
+      }
+      // Treat banned accounts as an error so UI can highlight in red
+      if (userInfo && userInfo.banned === true) {
+        throw new Error("banned");
+      }
+      if (userInfo?.error) {
+        throw new Error(`❌ (500) Failed to authenticate: "${userInfo.error}". The cookie is likely invalid or expired.`);
+      }
+      if (userInfo?.id && userInfo?.name) {
+        this.userInfo = userInfo;
+        try { ChargeCache.markFromUserInfo(userInfo); } catch { }
+        return true;
+      }
+      throw new Error(`❌ Unexpected JSON from /me (status ${status}): ${JSON.stringify(userInfo).slice(0, 200)}...`);
+    }
+    if (/error\s*1015/i.test(bodyText) || /rate.?limit/i.test(bodyText)) {
+      throw new Error("❌ (1015) You are being rate-limited by the server. Please wait a moment and try again.");
+    }
+    if (/cloudflare|attention required|access denied|just a moment|cf-ray|challenge-form|cf-chl/i.test(bodyText)) {
+      try { if (typeof this._lastProxyIdx === 'number') quarantineProxy(this._lastProxyIdx, 20, 'cloudflare_block_html'); } catch (_) { }
+      throw new Error(`❌ Cloudflare blocked the request.`);
+    }
+    if (/<!doctype html>/i.test(bodyText) || /<html/i.test(bodyText)) {
+      throw new Error(`❌ Failed to parse server response (HTML, status ${status}). Likely a login page → cookies invalid or expired. Snippet: "${short}..."`);
+    }
+    throw new Error(`❌ Failed to parse server response (status ${status}). Response: "${short}..."`);
+  }
+
+  async post(url, body) {
+    const headers = {
+      Accept: "application/json, text/plain, */*",
+      "Content-Type": "text/plain;charset=UTF-8",
+      Referer: "https://bplace.org/",
+      Origin: "https://bplace.org",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "same-site"
+    };
+    const request = await this.browser.fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      redirect: "manual"
+    });
+    const status = request.status;
+    const contentType = (request.headers.get("content-type") || "").toLowerCase();
+    const text = await request.text();
+    if (!contentType.includes("application/json")) {
+      const short = text.substring(0, 200);
+      if (/error\s*1015/i.test(text) || /rate.?limit/i.test(text) || status === 429) {
+        throw new Error("❌ (1015) You are being rate-limited. Please wait a moment and try again.");
+      }
+      if (status === 502) {
+        throw new Error(`❌ (502) Bad Gateway: The server is temporarily unavailable. Please try again later.`);
+      }
+      if (status === 401 || status === 403) {
+        return { status, data: { error: "Unauthorized" } };
+      }
+      return { status, data: { error: `Non-JSON response (status ${status}): ${short}...` } };
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return { status, data: { error: `Invalid JSON (status ${status}).` } };
+    }
+    return { status, data };
+  }
+
+  async loadTiles() {
+    this.tiles.clear();
+    const [tx, ty, px, py] = this.coords;
+    const endPx = px + this.template.width;
+    const endPy = py + this.template.height;
+    const endTx = tx + Math.floor(endPx / 1000);
+    const endTy = ty + Math.floor(endPy / 1000);
+
+    const loadOneTile = async (targetTx, targetTy, allowActivate = true) => {
+      try {
+        const url = `https://bplace.org/files/s0/tiles/${targetTx}/${targetTy}.png?t=${Date.now()}`;
+        const resp = await fetch(url, { headers: { Accept: "image/*" } });
+        if (resp.status === 404) {
+          // Tile might be not initialized yet
+          if (allowActivate && this.token) {
+            try {
+              const activated = await this._activateTileIfPossible(targetTx, targetTy);
+              if (activated) {
+                // brief wait and retry once
+                await new Promise((r) => setTimeout(r, 500));
+                return loadOneTile(targetTx, targetTy, false);
+              }
+            } catch (_) {
+              // ignore activation failures
+            }
+          }
+          try { log(this.userInfo?.id || "SYSTEM", this.userInfo?.name || "wplacer", `[${this.templateName}] ⚠️ Tile ${targetTx}, ${targetTy} may be inactive (404). Trying to activate and reload...`); } catch (_) {}
+          return null;
+        }
+        if (!resp.ok) return null;
+        const buffer = Buffer.from(await resp.arrayBuffer());
+        const image = await loadImage(buffer);
+        const canvas = createCanvas(image.width, image.height);
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(image, 0, 0);
+        const tileData = { width: canvas.width, height: canvas.height, data: Array.from({ length: canvas.width }, () => []) };
+        const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        for (let x = 0; x < canvas.width; x++) {
+          for (let y = 0; y < canvas.height; y++) {
+            const i = (y * canvas.width + x) * 4;
+            const [r, g, b, a] = [d.data[i], d.data[i + 1], d.data[i + 2], d.data[i + 3]];
+            tileData.data[x][y] = a === 255 ? (pallete[`${r},${g},${b}`] || 0) : 0;
+          }
+        }
+        return tileData;
+      } catch (_) {
+        return null;
+      }
+    };
+
+    const promises = [];
+    for (let currentTx = tx; currentTx <= endTx; currentTx++) {
+      for (let currentTy = ty; currentTy <= endTy; currentTy++) {
+        const p = loadOneTile(currentTx, currentTy).then((tileData) => {
+          if (tileData) this.tiles.set(`${currentTx}_${currentTy}`, tileData);
+        });
+        promises.push(p);
+      }
+    }
+    await Promise.all(promises);
+    return true;
+  }
+
+  async _activateTileIfPossible(targetTx, targetTy) {
+    try {
+      const [startTileX, startTileY, startPx, startPy] = this.coords;
+      const tileSize = 1000;
+      // iterate template area to find any pixel that belongs to this tile
+      for (let y = 0; y < this.template.height; y++) {
+        for (let x = 0; x < this.template.width; x++) {
+          const templateColor = this.template.data?.[x]?.[y];
+          if (templateColor == null) continue;
+          if (templateColor === 0 && !this.paintTransparentPixels) continue;
+          const globalPx = startPx + x;
+          const globalPy = startPy + y;
+          const tx = startTileX + Math.floor(globalPx / tileSize);
+          const ty = startTileY + Math.floor(globalPy / tileSize);
+          if (tx !== targetTx || ty !== targetTy) continue;
+          const localPx = globalPx % tileSize;
+          const localPy = globalPy % tileSize;
+          const body = { colors: [templateColor], coords: [localPx, localPy], t: this.token };
+          if (globalThis.__wplacer_last_fp) body.fp = globalThis.__wplacer_last_fp;
+          const res = await this._executePaint(targetTx, targetTy, body);
+          if (res && res.success && res.painted > 0) {
+            try { log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] ℹ️ Tile ${targetTx},${targetTy} might be inactive. Tried to activate by painting 1 pixel.`); } catch (_) {}
+            return true;
+          }
+          return false;
+        }
+      }
+    } catch (_) { }
+    return false;
+  }
+
+  hasColor(id) {
+    if (id < colorBitmapShift) return true; // transparent + basic colors
+    return !!(this.userInfo.extraColorsBitmap & (1 << (id - colorBitmapShift)));
+  }
+
+  async _executePaint(tx, ty, body) {
+    const url = `https://bplace.org/s0/pixel/${tx}/${ty}`;
+    if (body.colors.length === 0) return { painted: 0, success: true };
+    const response = await this.post(url, body);
+
+    if (response.data.painted && response.data.painted === body.colors.length) {
+      log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🎨 Painted ${body.colors.length} pixels on tile ${tx}, ${ty}.`);
+      
+      // Trigger grief check after painting (1 sample only)
+      if (currentSettings.griefMonitoringEnabled) {
+        const entry = Object.entries(templates).find(([tid, t]) => t && t.name === this.templateName && Array.isArray(t.coords) && JSON.stringify(t.coords) === JSON.stringify(this.coords));
+        const tpl = entry ? entry[1] : null;
+        const tplId = entry ? entry[0] : null;
+        if (tpl && tplId) {
+          // Check griefers asynchronously without blocking painting (1 sample only)
+          setImmediate(() => {
+            checkGriefersInTemplate(tplId, tpl, 1);
+          });
+        }
+      }
+      
+      try {
+        // Heatmap logging: write per-template records
+        const entry = Object.entries(templates).find(([tid, t]) => t && t.name === this.templateName && Array.isArray(t.coords) && JSON.stringify(t.coords) === JSON.stringify(this.coords));
+        const tpl = entry ? entry[1] : null;
+        const tplId = entry ? entry[0] : null;
+        if (tpl && tpl.heatmapEnabled) {
+          const [TlX, TlY, PxX0, PxY0] = this.coords;
+          const date = Date.now();
+          const coords = body.coords || [];
+          // records are pairs Px X, Px Y (convert to template-local coordinates)
+          const startGlobalX = (TlX * 1000) + (PxX0 | 0);
+          const startGlobalY = (TlY * 1000) + (PxY0 | 0);
+          const pairs = [];
+          for (let i = 0; i < coords.length; i += 2) {
+            const localPx = coords[i];
+            const localPy = coords[i + 1];
+            if (typeof localPx === 'number' && typeof localPy === 'number') {
+              const globalX = (tx * 1000) + localPx;
+              const globalY = (ty * 1000) + localPy;
+              const tplX = globalX - startGlobalX; // template-local X
+              const tplY = globalY - startGlobalY; // template-local Y
+              if (Number.isFinite(tplX) && Number.isFinite(tplY)) {
+                pairs.push({ date, "Tl X": TlX, "Tl Y": TlY, "Px X": tplX, "Px Y": tplY });
+              }
+            }
+          }
+          if (pairs.length) {
+            const idPart = tplId ? String(tplId) : encodeURIComponent(this.templateName);
+            const fileName = `${idPart}.jsonl`;
+            const filePath = path.join(heatMapsDir, fileName);
+            // ensure file exists
+            try { if (!existsSync(filePath)) writeFileSync(filePath, ""); } catch (_) { }
+            // append as JSONL to avoid memory usage
+            const lines = pairs.map(o => JSON.stringify(o)).join("\n") + "\n";
+            appendFileSync(filePath, lines);
+            // enforce limit by truncating oldest when exceeding lines
+            try {
+              const limit = Math.max(0, Math.floor(Number(tpl.heatmapLimit || 10000))) || 10000;
+              if (limit > 0) {
+                const raw = readFileSync(filePath, "utf8");
+                const arr = raw.split(/\r?\n/).filter(Boolean);
+                if (arr.length > limit) {
+                  const keep = arr.slice(arr.length - limit);
+                  writeFileSync(filePath, keep.join("\n") + "\n");
+                }
+              }
+            } catch (_) { }
+          }
+        }
+      } catch (_) { }
+      return { painted: body.colors.length, success: true };
+    } else if (response.status === 401 || response.status === 403) {
+      // Authentication expired - mark for cookie refresh
+      return { painted: 0, success: false, reason: "auth_expired" };
+    } else if (response.status === 451 && response.data.suspension) {
+      throw new SuspensionError(`❌ Account is suspended (451).`, response.data.durationMs || 0);
+    } else if (response.status === 500) {
+      log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] ❌ Server error (500) - waiting before retry...`);
+      await sleep(40000);
+      return { painted: 0, success: false, reason: "server_error" };
+    } else if (response.status === 429 || (response.data.error && response.data.error.includes("Error 1015"))) {
+      throw new Error("❌ Rate limited (429/1015) - waiting before retry");
+    }
+    throw new Error(`❌ Unexpected response for tile ${tx},${ty}: ${JSON.stringify(response)}`);
+  }
+
+  // ----- Helpers for "old" painting logic -----
+  _shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  _globalXY(p) {
+    const [sx, sy] = this.coords;
+    return { gx: (p.tx - sx) * 1000 + p.px, gy: (p.ty - sy) * 1000 + p.py };
+  }
+  _templateRelXY(p) {
+    const [sx, sy, spx, spy] = this.coords;
+    const gx = (p.tx - sx) * 1000 + p.px;
+    const gy = (p.ty - sy) * 1000 + p.py;
+    return { x: gx - spx, y: gy - spy };
+  }
+
+  _pickBurstSeeds(pixels, k = 2, _ignoredTopFuzz = 5) {
+    if (!pixels?.length) return [];
+    const pts = pixels.map((p) => this._globalXY(p));
+
+    // Deterministic selection: pick lexicographically smallest point as first
+    const firstIdx = (() => {
+      let idx = 0;
+      for (let i = 1; i < pts.length; i++) {
+        if (pts[i].gx < pts[idx].gx || (pts[i].gx === pts[idx].gx && pts[i].gy < pts[idx].gy)) idx = i;
+      }
+      return idx;
+    })();
+
+    const seeds = [pts[firstIdx]];
+    if (pts.length === 1) return seeds.map((s) => ({ gx: s.gx, gy: s.gy }));
+
+    // Second: farthest from first
+    let far = 0, best = -1;
+    for (let i = 0; i < pts.length; i++) {
+      const dx = pts[i].gx - pts[firstIdx].gx;
+      const dy = pts[i].gy - pts[firstIdx].gy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > best) { best = d2; far = i; }
+    }
+    if (!seeds.some((s) => s.gx === pts[far].gx && s.gy === pts[far].gy)) seeds.push(pts[far]);
+
+    // Next: farthest from nearest existing seed (maximin), deterministic
+    while (seeds.length < Math.min(k, pts.length)) {
+      let bestIdx = -1;
+      let bestMinD2 = -1;
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        if (seeds.some((s) => s.gx === p.gx && s.gy === p.gy)) continue;
+        let minD2 = Infinity;
+        for (const s of seeds) {
+          const dx = s.gx - p.gx;
+          const dy = s.gy - p.gy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < minD2) minD2 = d2;
+        }
+        if (minD2 > bestMinD2) { bestMinD2 = minD2; bestIdx = i; }
+      }
+      if (bestIdx < 0) break;
+      seeds.push(pts[bestIdx]);
+    }
+
+    return seeds.map((s) => ({ gx: s.gx, gy: s.gy }));
+  }
+
+  /**
+   * Multi-source BFS ordering like in the old version.
+   * seeds can be number (count) or array of {gx,gy}.
+   */
+  _orderByBurst(mismatchedPixels, seeds = 2) {
+    if (mismatchedPixels.length <= 2) return mismatchedPixels;
+
+    const [startX, startY] = this.coords;
+    const byKey = new Map();
+    for (const p of mismatchedPixels) {
+      const gx = (p.tx - startX) * 1000 + p.px;
+      const gy = (p.ty - startY) * 1000 + p.py;
+      p._gx = gx;
+      p._gy = gy;
+      byKey.set(`${gx},${gy}`, p);
+    }
+
+    const useSeeds = Array.isArray(seeds) ? seeds.slice() : this._pickBurstSeeds(mismatchedPixels, seeds);
+
+    // mark used for nearest search
+    const used = new Set();
+    const nearest = (gx, gy) => {
+      let best = null,
+        bestD = Infinity,
+        key = null;
+      for (const p of mismatchedPixels) {
+        const k = `${p._gx},${p._gy}`;
+        if (used.has(k)) continue;
+        const dx = p._gx - gx,
+          dy = p._gy - gy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD) {
+          bestD = d2;
+          best = p;
+          key = k;
+        }
+      }
+      if (best) used.add(key);
+      return best;
+    };
+
+    const starts = useSeeds.map((s) => nearest(s.gx, s.gy)).filter(Boolean);
+
+    const visited = new Set();
+    const queues = [];
+    const speeds = [];
+    const prefs = [];
+
+    const randDir = () => [[1, 0], [-1, 0], [0, 1], [0, -1]][Math.floor(Math.random() * 4)];
+
+    for (const sp of starts) {
+      const k = `${sp._gx},${sp._gy}`;
+      if (!visited.has(k)) {
+        visited.add(k);
+        queues.push([sp]);
+        speeds.push(0.7 + Math.random() * 1.1);
+        prefs.push(randDir());
+      }
+    }
+
+    const pickQueue = () => {
+      const weights = speeds.map((s, i) => (queues[i].length ? s : 0));
+      const sum = weights.reduce((a, b) => a + b, 0);
+      if (!sum) return -1;
+      let r = Math.random() * sum;
+      for (let i = 0; i < weights.length; i++) {
+        r -= weights[i];
+        if (r <= 0) return i;
+      }
+      return weights.findIndex((w) => w > 0);
+    };
+
+    const orderNeighbors = (dir) => {
+      const base = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+      base.sort(
+        (a, b) =>
+          b[0] * dir[0] +
+          b[1] * dir[1] +
+          (Math.random() - 0.5) * 0.2 -
+          (a[0] * dir[0] + a[1] * dir[1] + (Math.random() - 0.5) * 0.2)
+      );
+      return base;
+    };
+
+    const dash = (from, qi, dir) => {
+      const dashChance = 0.45;
+      const maxDash = 1 + Math.floor(Math.random() * 3);
+      if (Math.random() > dashChance) return;
+      let cx = from._gx,
+        cy = from._gy;
+      for (let step = 0; step < maxDash; step++) {
+        const nx = cx + dir[0],
+          ny = cy + dir[1];
+        const key = `${nx},${ny}`;
+        if (!byKey.has(key) || visited.has(key)) break;
+        visited.add(key);
+        queues[qi].push(byKey.get(key));
+        cx = nx;
+        cy = ny;
+      }
+    };
+
+    const out = [];
+
+    while (true) {
+      const qi = pickQueue();
+      if (qi === -1) break;
+      const cur = queues[qi].shift();
+      out.push(cur);
+
+      const neigh = orderNeighbors(prefs[qi]);
+      let firstDir = null;
+      let firstPt = null;
+
+      for (const [dx, dy] of neigh) {
+        const nx = cur._gx + dx,
+          ny = cur._gy + dy;
+        const k = `${nx},${ny}`;
+        if (byKey.has(k) && !visited.has(k)) {
+          visited.add(k);
+          const p = byKey.get(k);
+          queues[qi].push(p);
+          if (!firstDir) {
+            firstDir = [dx, dy];
+            firstPt = p;
+          }
+        }
+      }
+
+      if (firstDir) {
+        if (Math.random() < 0.85) prefs[qi] = firstDir;
+        dash(firstPt, qi, prefs[qi]);
+      }
+    }
+
+    // pick up isolated areas
+    if (out.length < mismatchedPixels.length) {
+      for (const p of mismatchedPixels) {
+        const k = `${p._gx},${p._gy}`;
+        if (!visited.has(k)) {
+          visited.add(k);
+          const q = [p];
+          while (q.length) {
+            const c = q.shift();
+            out.push(c);
+            for (const [dx, dy] of orderNeighbors(randDir())) {
+              const nx = c._gx + dx,
+                ny = c._gy + dy;
+              const kk = `${nx},${ny}`;
+              if (byKey.has(kk) && !visited.has(kk)) {
+                visited.add(kk);
+                q.push(byKey.get(kk));
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // cleanup temp props
+    for (const p of out) {
+      delete p._gx;
+      delete p._gy;
+    }
+    return out;
+  }
+
+  _getMismatchedPixels() {
+    const [startX, startY, startPx, startPy] = this.coords;
+    const mismatched = [];
+    for (let y = 0; y < this.template.height; y++) {
+      for (let x = 0; x < this.template.width; x++) {
+        const _templateColor = this.template.data[x][y];
+
+        // old behavior: 0 means "transparent pixel" in the template.
+        // If paintTransparentPixels is false — we skip those; if true — we try to paint them too.
+        if (_templateColor === 0 && !this.paintTransparentPixels) continue;
+        if (_templateColor == null) continue;
+
+        // substitute -1 for transparent
+        const templateColor = (_templateColor == -1 ? 0 : _templateColor);
+
+        const globalPx = startPx + x;
+        const globalPy = startPy + y;
+        const targetTx = startX + Math.floor(globalPx / 1000);
+        const targetTy = startY + Math.floor(globalPy / 1000);
+        const localPx = globalPx % 1000;
+        const localPy = globalPy % 1000;
+
+        const neighbors = [
+          this.template.data[x - 1]?.[y],
+          this.template.data[x + 1]?.[y],
+          this.template.data[x]?.[y - 1],
+          this.template.data[x]?.[y + 1],
+        ];
+        const isEdge = neighbors.some((n) => n === 0 || n === undefined);
+
+        const tile = this.tiles.get(`${targetTx}_${targetTy}`);
+        if (!tile || !tile.data[localPx]) {
+          // Treat missing tile data as mismatch to avoid premature finish
+          if (this.hasColor(templateColor)) {
+            mismatched.push({ tx: targetTx, ty: targetTy, px: localPx, py: localPy, color: templateColor, isEdge: isEdge });
+          }
+          continue;
+        }
+
+        const tileColor = tile.data[localPx][localPy];
+
+        // Setting to paint "behind" other's artwork, by not painting over already painted pixels.
+        const shouldPaint = this.skipPaintedPixels
+          ? tileColor === 0
+          : templateColor !== tileColor;
+
+        if (shouldPaint && this.hasColor(templateColor)) {
+          mismatched.push({ tx: targetTx, ty: targetTy, px: localPx, py: localPy, color: templateColor, isEdge: isEdge });
+        }
+      }
+    }
+    return mismatched;
+  }
+
+  /**
+   * Paint using "old" modes.
+   * method is read from settings.drawingMethod in TemplateManager.
+   */
+  async paint(method = "linear") {
+    await this.loadUserInfo();
+    if (this._isCancelled()) return 0;
+
+    switch (method) {
+      case "linear":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Top to Bottom)...`);
+        break;
+      case "linear-reversed":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Bottom to Top)...`);
+        break;
+      case "linear-ltr":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Left to Right)...`);
+        break;
+      case "linear-rtl":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Right to Left)...`);
+        break;
+      case "radial-inward":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Radial inward)...`);
+        break;
+      case "radial-outward":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Radial outward)...`);
+        break;
+      case "singleColorRandom":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Random Color)...`);
+        break;
+      case "colorByColor":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Color by Color)...`);
+        break;
+      case "colors-burst-rare":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Colors burst, rare first)...`);
+        break;
+      case "random":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Random Scatter)...`);
+        break;
+      case "burst":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Burst / Multi-source)...`);
+        break;
+      case "outline-then-burst":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Outline then Burst)...`);
+        break;
+      case "burst-mixed":
+        log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🧱 Painting (Burst Mixed)...`);
+        break;
+      default:
+        throw new Error(`Unknown paint method: ${method}`);
+    }
+
+    while (true) {
+
+      if (this._isCancelled()) return 0;
+
+      const nowTiles = Date.now();
+      const TILES_CACHE_MS = 3000;
+      if (nowTiles - this._lastTilesAt >= TILES_CACHE_MS || this.tiles.size === 0) {
+        await this.loadTiles();
+        this._lastTilesAt = Date.now();
+      }
+      if (!this.token) throw new Error("REFRESH_TOKEN"); // TokenManager must provide before calling
+
+      let activeMethod = method;
+      if (method === "burst-mixed") {
+        const pool = ["outline-then-burst", "burst", "colors-burst-rare"];
+        activeMethod = pool[Math.floor(Math.random() * pool.length)];
+        try {
+          const cfg = (currentSettings && currentSettings.logCategories) || {};
+          if (cfg.painting !== false) {
+            log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🎲 Mixed mode picked this turn: ${activeMethod}`);
+          }
+        } catch (_) { }
+      }
+
+      // Sei - Moved this below "burst-mixed" check above; Makes more sense in console.
+      let mismatchedPixels = this._getMismatchedPixels();
+      if (mismatchedPixels.length === 0) return 0;
+
+      log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] Found ${mismatchedPixels.length} mismatched pixels.`);
+
+      // "Outline Mode", an incredibly convenient tool for securing your space before drawing.
+      if (this.outlineMode) {
+        const edge = mismatchedPixels.filter((p) => p.isEdge);
+        if (edge.length > 0) {
+          log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] Outlining design first.`);
+          mismatchedPixels = edge;
+        }
+      }
+      switch (activeMethod) {
+        case "linear-reversed":
+          mismatchedPixels.reverse();
+          break;
+
+        case "linear-ltr": {
+          const [startX, startY] = this.coords;
+          mismatchedPixels.sort((a, b) => {
+            const aGlobalX = (a.tx - startX) * 1000 + a.px;
+            const bGlobalX = (b.tx - startX) * 1000 + b.px;
+            if (aGlobalX !== bGlobalX) return aGlobalX - bGlobalX;
+            return (a.ty - startY) * 1000 + a.py - ((b.ty - startY) * 1000 + b.py);
+          });
+          break;
+        }
+
+        case "linear-rtl": {
+          const [startX, startY] = this.coords;
+          mismatchedPixels.sort((a, b) => {
+            const aGlobalX = (a.tx - startX) * 1000 + a.px;
+            const bGlobalX = (b.tx - startX) * 1000 + b.px;
+            if (aGlobalX !== bGlobalX) return bGlobalX - aGlobalX;
+            return (a.ty - startY) * 1000 + a.py - ((b.ty - startY) * 1000 + b.py);
+          });
+          break;
+        }
+
+        case "radial-inward": {
+          const [sx, sy, spx, spy] = this.coords;
+          const cx = spx + (this.template.width - 1) / 2;
+          const cy = spy + (this.template.height - 1) / 2;
+          const r2 = (p) => {
+            const gx = (p.tx - sx) * 1000 + p.px;
+            const gy = (p.ty - sy) * 1000 + p.py;
+            const dx = gx - cx, dy = gy - cy;
+            return dx * dx + dy * dy;
+          };
+          const ang = (p) => {
+            const gx = (p.tx - sx) * 1000 + p.px;
+            const gy = (p.ty - sy) * 1000 + p.py;
+            return Math.atan2(gy - cy, gx - cx);
+          };
+          mismatchedPixels.sort((a, b) => {
+            const d = r2(b) - r2(a);
+            return d !== 0 ? d : (ang(a) - ang(b));
+          });
+          break;
+        }
+
+        case "radial-outward": {
+          const [sx, sy, spx, spy] = this.coords;
+          const cx = spx + (this.template.width - 1) / 2;
+          const cy = spy + (this.template.height - 1) / 2;
+          const r2 = (p) => {
+            const gx = (p.tx - sx) * 1000 + p.px;
+            const gy = (p.ty - sy) * 1000 + p.py;
+            const dx = gx - cx, dy = gy - cy;
+            return dx * dx + dy * dy;
+          };
+          const ang = (p) => {
+            const gx = (p.tx - sx) * 1000 + p.px;
+            const gy = (p.ty - sy) * 1000 + p.py;
+            return Math.atan2(gy - cy, gx - cx);
+          };
+          mismatchedPixels.sort((a, b) => {
+            const d = r2(a) - r2(b);
+            return d !== 0 ? d : (ang(a) - ang(b));
+          });
+          break;
+        }
+
+        case "singleColorRandom":
+        case "colorByColor": {
+          const pixelsByColor = mismatchedPixels.reduce((acc, p) => {
+            if (!acc[p.color]) acc[p.color] = [];
+            acc[p.color].push(p);
+            return acc;
+          }, {});
+          const colors = Object.keys(pixelsByColor);
+          if (method === "singleColorRandom") {
+            for (let i = colors.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [colors[i], colors[j]] = [colors[j], colors[i]];
+            }
+          }
+          mismatchedPixels = colors.flatMap((color) => pixelsByColor[color]);
+          break;
+        }
+
+        case "colors-burst-rare": {
+          const byColor = mismatchedPixels.reduce((m, p) => {
+            (m[p.color] ||= []).push(p);
+            return m;
+          }, {});
+          const colorsAsc = Object.keys(byColor).sort((a, b) => byColor[a].length - byColor[b].length);
+          const desired = Math.max(1, Math.min(this.settings?.seedCount ?? 2, 16));
+          if (!this._burstSeeds || this._burstSeeds.length !== desired) {
+            this._burstSeeds = this._pickBurstSeeds(mismatchedPixels, desired);
+            try { const cfg = (currentSettings && currentSettings.logCategories) || {}; if (cfg.painting !== false) { log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 💥 Burst seeds (${desired}): ${JSON.stringify(this._burstSeeds)}`); } } catch (_) { }
+          }
+          const out = [];
+          for (const c of colorsAsc) {
+            out.push(...this._orderByBurst(byColor[c], this._burstSeeds));
+          }
+          mismatchedPixels = out;
+          break;
+        }
+
+        case "random":
+          this._shuffle(mismatchedPixels);
+          break;
+
+        case "burst": {
+          const desired = Math.max(1, Math.min(this.settings?.seedCount ?? 2, 16));
+          if (!this._burstSeeds || this._burstSeeds.length !== desired) {
+            this._burstSeeds = this._pickBurstSeeds(mismatchedPixels, desired);
+            try { const cfg = (currentSettings && currentSettings.logCategories) || {}; if (cfg.painting !== false) { log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 💥 Burst seeds (${desired}): ${JSON.stringify(this._burstSeeds)}`); } } catch (_) { }
+          }
+          mismatchedPixels = this._orderByBurst(mismatchedPixels, this._burstSeeds);
+          break;
+        }
+
+        case "outline-then-burst": {
+          const desired = Math.max(1, Math.min(this.settings?.seedCount ?? 2, 16));
+          const outline = [];
+          const inside = [];
+
+          for (const p of mismatchedPixels) {
+            if (p.color === 0) { inside.push(p); continue; }
+            const { x, y } = this._templateRelXY(p);
+            const w = this.template.width, h = this.template.height;
+            const tcol = this.template.data[x][y];
+
+            let isOutline = (x === 0 || y === 0 || x === w - 1 || y === h - 1);
+            if (!isOutline) {
+              const neigh = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+              for (const [dx, dy] of neigh) {
+                const nx = x + dx, ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= w || ny >= h) { isOutline = true; break; }
+                if (this.template.data[nx][ny] !== tcol) { isOutline = true; break; }
+              }
+            }
+            (isOutline ? outline : inside).push(p);
+          }
+
+          const pickRandomSeed = (arr) => {
+            const p = arr[Math.floor(Math.random() * arr.length)];
+            const { gx, gy } = this._globalXY(p);
+            return [{ gx, gy }];
+          };
+
+          if (!this._burstSeeds || this._burstSeeds.length !== desired) {
+            this._burstSeeds = this._pickBurstSeeds(mismatchedPixels, desired);
+            try { const cfg = (currentSettings && currentSettings.logCategories) || {}; if (cfg.painting !== false) { log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 💥 Burst seeds (${desired}): ${JSON.stringify(this._burstSeeds)}`); } } catch (_) { }
+          }
+          const orderedOutline = outline.length ? this._orderByBurst(outline, this._burstSeeds) : [];
+          const orderedInside = inside.length ? this._orderByBurst(inside, this._burstSeeds) : [];
+
+          mismatchedPixels = orderedOutline.concat(orderedInside);
+          break;
+        }
+      }
+
+      const allowedByCharges = Math.max(0, Math.floor(this.userInfo?.charges?.count || 0));
+      const maxPerPass = Number.isFinite(this.settings?.maxPixelsPerPass) ? Math.max(0, Math.floor(this.settings.maxPixelsPerPass)) : 0;
+      const limit = maxPerPass > 0 ? Math.min(allowedByCharges, maxPerPass) : allowedByCharges;
+      if (limit <= 0) {
+
+        return 0;
+      }
+      const pixelsToPaint = mismatchedPixels.slice(0, limit);
+      const bodiesByTile = pixelsToPaint.reduce((acc, p) => {
+        const key = `${p.tx},${p.ty}`;
+        if (!acc[key]) acc[key] = { colors: [], coords: [] };
+        acc[key].colors.push(p.color);
+        acc[key].coords.push(p.px, p.py);
+        return acc;
+      }, {});
+
+      let totalPainted = 0;
+      let needsRetry = false;
+
+      for (const tileKey in bodiesByTile) {
+        if (this._isCancelled()) { needsRetry = false; break; }
+        const [tx, ty] = tileKey.split(",").map(Number);
+        const body = { ...bodiesByTile[tileKey], t: this.token };
+        if (globalThis.__wplacer_last_fp) body.fp = globalThis.__wplacer_last_fp;
+        const result = await this._executePaint(tx, ty, body);
+        if (result.success) {
+          totalPainted += result.painted;
+        } else {
+          // token refresh or temp error — let caller handle
+          needsRetry = true;
+          break;
+        }
+      }
+
+      if (this._isCancelled()) return totalPainted;
+
+      if (!needsRetry) {
+        this._activeBurstSeedIdx = null; // next turn: pick a new seed
+        return totalPainted;
+      } else {
+        // break and let manager refresh token
+        throw new Error("REFRESH_TOKEN");
+      }
+    }
+  }
+
+  async buyProduct(productId, amount, variant) {
+    const body = { product: { id: productId, amount } };
+    if (typeof variant === "number") body.product.variant = variant;
+
+    const response = await this.post(`https://bplace.org/purchase`, body);
+
+    if (response.status === 200 && response.data && response.data.success === true) {
+      let msg = `🛒 Purchase successful for product #${productId} (amount: ${amount})`;
+      if (productId === 80) msg = `🛒 Bought ${amount * 30} pixels for ${amount * 500} droplets`;
+      else if (productId === 70) msg = `🛒 Bought ${amount} Max Charge Upgrade(s) for ${amount * 500} droplets`;
+      else if (productId === 100 && typeof variant === "number") msg = `🛒 Bought color #${variant}`;
+      else if (productId === 110 && typeof variant === "number") msg = `🛒 Bought flag #${variant}`;
+      log(this.userInfo?.id || "SYSTEM", this.userInfo?.name || "wplacer", `[${this.templateName}] ${msg}`);
+      return true;
+    }
+
+    if (response.status === 403) {
+      const err = new Error("FORBIDDEN_OR_INSUFFICIENT");
+      err.code = 403;
+      throw err;
+    }
+
+    if (response.status === 429 || (response.data?.error && response.data.error.includes("Error 1015"))) {
+      throw new Error("(1015) You are being rate-limited while trying to make a purchase. Please wait.");
+    }
+
+    throw new Error(`Unexpected response during purchase: ${JSON.stringify(response)}`);
+  }
+
+  async equipFlag(flagId) {
+    const id = Number(flagId) || 0;
+    const url = `https://bplace.org/flag/equip/${id}`;
+    const res = await this.post(url, {});
+    if (res.status === 200 && res.data && res.data.success === true) {
+      if (id === 0) {
+        log(this.userInfo?.id || "SYSTEM", this.userInfo?.name || "wplacer", `[${this.templateName}] 🏳️ Unequipped flag`);
+      } else {
+        log(this.userInfo?.id || "SYSTEM", this.userInfo?.name || "wplacer", `[${this.templateName}] 🏳️ Equipped flag #${id}`);
+      }
+      return true;
+    }
+    if (res.status === 403) {
+      const err = new Error("FORBIDDEN_OR_INSUFFICIENT");
+      err.code = 403;
+      throw err;
+    }
+    if (res.status === 429 || (res.data?.error && res.data.error.includes("Error 1015"))) {
+      throw new Error("(1015) You are being rate-limited while trying to equip a flag. Please wait.");
+    }
+    throw new Error(`Unexpected response during flag equip: ${JSON.stringify(res)}`);
+  }
+
+  async pixelsLeft() {
+    await this.loadTiles();
+    return this._getMismatchedPixels().length;
+  }
+
+  async pixelsLeftIgnoringOwnership() {
+    await this.loadTiles();
+    const [startX, startY, startPx, startPy] = this.coords;
+    let count = 0;
+    for (let y = 0; y < this.template.height; y++) {
+      for (let x = 0; x < this.template.width; x++) {
+        const templateColor = this.template.data[x][y];
+        if (templateColor == null) continue;
+        if (templateColor === 0 && !this.paintTransparentPixels) continue;
+        const globalPx = startPx + x;
+        const globalPy = startPy + y;
+        const targetTx = startX + Math.floor(globalPx / 1000);
+        const targetTy = startY + Math.floor(globalPy / 1000);
+        const localPx = globalPx % 1000;
+        const localPy = globalPy % 1000;
+        const tile = this.tiles.get(`${targetTx}_${targetTy}`);
+        if (!tile || !tile.data[localPx]) continue;
+        const tileColor = tile.data[localPx][localPy];
+
+
+        const shouldPaint = this.skipPaintedPixels
+          ? tileColor === 0
+          : templateColor !== tileColor;
+
+        if (shouldPaint) count++;
+      }
+    }
+    return count;
+  }
+
+  // Counts mismatches ignoring ownership and skipPaintedPixels setting
+  // - Respects transparency: skips templateColor === 0 unless paintTransparentPixels is true
+  // - Does NOT check color ownership and does NOT apply skipPaintedPixels logic
+  async pixelsLeftRawMismatch() {
+    await this.loadTiles();
+    const [startX, startY, startPx, startPy] = this.coords;
+    let count = 0;
+    for (let y = 0; y < this.template.height; y++) {
+      for (let x = 0; x < this.template.width; x++) {
+        const templateColor = this.template.data[x][y];
+        if (templateColor == null) continue;
+        if (templateColor === 0 && !this.paintTransparentPixels) continue;
+        const globalPx = startPx + x;
+        const globalPy = startPy + y;
+        const targetTx = startX + Math.floor(globalPx / 1000);
+        const targetTy = startY + Math.floor(globalPy / 1000);
+        const localPx = globalPx % 1000;
+        const localPy = globalPy % 1000;
+        const tile = this.tiles.get(`${targetTx}_${targetTy}`);
+        if (!tile || !tile.data[localPx]) {
+          // Treat missing tile as mismatch so template doesn't finish prematurely
+          count++;
+          continue;
+        }
+        const tileColor = tile.data[localPx][localPy];
+        if (templateColor !== tileColor) count++;
+      }
+    }
+    return count;
+  }
+
+  async mismatchesSummary() {
+    await this.loadTiles();
+    const [startX, startY, startPx, startPy] = this.coords;
+    let total = 0, basic = 0, premium = 0;
+    const premiumColors = new Set();
+    for (let y = 0; y < this.template.height; y++) {
+      for (let x = 0; x < this.template.width; x++) {
+        const templateColor = this.template.data[x][y];
+        if (templateColor == null) continue;
+        if (templateColor === 0 && !this.paintTransparentPixels) continue;
+        const globalPx = startPx + x;
+        const globalPy = startPy + y;
+        const targetTx = startX + Math.floor(globalPx / 1000);
+        const targetTy = startY + Math.floor(globalPy / 1000);
+        const localPx = globalPx % 1000;
+        const localPy = globalPy % 1000;
+        const tile = this.tiles.get(`${targetTx}_${targetTy}`);
+        let shouldPaint = false;
+        if (!tile || !tile.data[localPx]) {
+          // Missing tile -> treat as mismatch
+          shouldPaint = true;
+        } else {
+          const tileColor = tile.data[localPx][localPy];
+          shouldPaint = this.skipPaintedPixels ? (tileColor === 0) : (templateColor !== tileColor);
+        }
+
+        if (shouldPaint) {
+          total++;
+          if (templateColor >= 32) { premium++; premiumColors.add(templateColor); }
+          else if (templateColor > 0) { basic++; }
+        }
+      }
+    }
+    return { total, basic, premium, premiumColors };
+  }
+}
+
+// --- Data persistence ---
+const loadJSON = (filename) =>
+  existsSync(path.join(dataDir, filename)) ? JSON.parse(readFileSync(path.join(dataDir, filename), "utf8")) : {};
+const saveJSON = (filename, data) => writeFileSync(path.join(dataDir, filename), JSON.stringify(data, null, 4));
+
+const users = loadJSON("users.json");
+const saveUsers = () => saveJSON("users.json", users);
+
+// Active TemplateManagers (in-memory)
+const templates = {};
+const saveTemplates = () => {
+  const templatesToSave = {};
+  for (const id in templates) {
+    const t = templates[id];
+    templatesToSave[id] = {
+      name: t.name,
+      template: t.template,
+      coords: t.coords,
+      canBuyCharges: t.canBuyCharges,
+      canBuyMaxCharges: t.canBuyMaxCharges,
+      autoBuyNeededColors: !!t.autoBuyNeededColors,
+      antiGriefMode: t.antiGriefMode,
+      userIds: t.userIds,
+      paintTransparentPixels: t.paintTransparentPixels,
+
+      skipPaintedPixels: !!t.skipPaintedPixels,
+      outlineMode: !!t.outlineMode,
+      burstSeeds: t.burstSeeds || null,
+      heatmapEnabled: !!t.heatmapEnabled,
+      heatmapLimit: Math.max(0, Math.floor(Number(t.heatmapLimit || 10000))),
+      autoStart: !!t.autoStart
+    };
+  }
+  saveJSON("templates.json", templatesToSave);
+};
+
+// --- Settings ---
+let currentSettings = {
+  turnstileNotifications: false,
+  accountCooldown: 20000,
+  purchaseCooldown: 5000,
+  keepAliveCooldown: 5000,
+  dropletReserve: 0,
+  griefMonitoringEnabled: false,
+  antiGriefStandby: 600000,
+  drawingMethod: "linear",
+  chargeThreshold: 0.5,
+  alwaysDrawOnCharge: false,
+  maxPixelsPerPass: 0,
+  seedCount: 2,
+  proxyEnabled: false,
+  proxyRotationMode: "sequential",
+  logProxyUsage: false,
+  parallelWorkers: 4,
+  logCategories: {
+    tokenManager: true,
+    cache: true,
+    queuePreview: false,
+    painting: false,
+    startTurn: false,
+    mismatches: false,
+    estimatedTime: false,
+  },
+  logMaskPii: false
+};
+if (existsSync(path.join(dataDir, "settings.json"))) {
+  currentSettings = { ...currentSettings, ...loadJSON("settings.json") };
+}
+const saveSettings = () => saveJSON("settings.json", currentSettings);
+
+// --- Server state ---
+const activeBrowserUsers = new Set();
+
+// Colors check job progress state
+let colorsCheckJob = {
+  active: false,
+  total: 0,
+  completed: 0,
+  startedAt: 0,
+  finishedAt: 0,
+  lastUserId: null,
+  lastUserName: null,
+  report: []
+};
+
+// Purchase color job progress state
+let purchaseColorJob = {
+  active: false,
+  total: 0,
+  completed: 0,
+  startedAt: 0,
+  finishedAt: 0,
+  lastUserId: null,
+  lastUserName: null
+};
+
+// Flags check job progress state
+let flagsCheckJob = {
+  active: false,
+  total: 0,
+  completed: 0,
+  startedAt: 0,
+  finishedAt: 0,
+  lastUserId: null,
+  lastUserName: null,
+  report: []
+};
+
+// Purchase flag job progress state
+let purchaseFlagJob = {
+  active: false,
+  total: 0,
+  completed: 0,
+  startedAt: 0,
+  finishedAt: 0,
+  lastUserId: null,
+  lastUserName: null
+};
+
+// Buy Max Upgrades job progress state
+let buyMaxJob = {
+  active: false,
+  total: 0,
+  completed: 0,
+  startedAt: 0,
+  finishedAt: 0,
+  lastUserId: null,
+  lastUserName: null
+};
+
+// Buy Charges job progress state
+let buyChargesJob = {
+  active: false,
+  total: 0,
+  completed: 0,
+  startedAt: 0,
+  finishedAt: 0,
+  lastUserId: null,
+  lastUserName: null
+};
+
+const longWaiters = new Set();
+const notifyTokenNeeded = () => {
+  for (const fn of Array.from(longWaiters)) {
+    try { fn(); } catch { }
+  }
+  longWaiters.clear();
+};
+
+const TokenManager = {
+  tokenQueue: [],
+  tokenPromise: null,
+  resolvePromise: null,
+  isTokenNeeded: false,
+  TOKEN_EXPIRATION_MS: 2 * 60 * 1000,
+  _lastNeededAt: 0,
+
+  _purgeExpiredTokens() {
+    const now = Date.now();
+    let changed = false;
+    const filtered = [];
+    for (const item of this.tokenQueue) {
+      if (item && typeof item === 'object' && item.token) {
+        if (now - item.receivedAt < this.TOKEN_EXPIRATION_MS) filtered.push(item);
+        else changed = true;
+      } else {
+        // backward compatibility: plain string token — keep but wrap
+        filtered.push({ token: String(item), receivedAt: now });
+        changed = true;
+      }
+    }
+    if (changed) this.tokenQueue = filtered;
+  },
+
+  getToken() {
+    this._purgeExpiredTokens();
+    if (this.tokenQueue.length > 0) {
+      const head = this.tokenQueue[0];
+      return Promise.resolve(head && head.token ? head.token : head);
+    }
+    if (!this.tokenPromise) {
+      log("SYSTEM", "wplacer", "🛡️ TOKEN_MANAGER: A task is waiting for a token. Flagging for clients.");
+      this.isTokenNeeded = true;
+      this._lastNeededAt = Date.now();
+      notifyTokenNeeded();
+      this.tokenPromise = new Promise((resolve) => {
+        this.resolvePromise = resolve;
+      });
+    }
+    return this.tokenPromise;
+  },
+  setToken(t) {
+    log("SYSTEM", "wplacer", `🛡️ TOKEN_MANAGER: Token received. Queue size: ${this.tokenQueue.length + 1}`);
+    this.isTokenNeeded = false;
+    this.tokenQueue.push({ token: t, receivedAt: Date.now() });
+    if (this.resolvePromise) {
+      const head = this.tokenQueue[0];
+      this.resolvePromise(head && head.token ? head.token : head);
+      this.tokenPromise = null;
+      this.resolvePromise = null;
+    }
+  },
+  invalidateToken() {
+    this.tokenQueue.shift();
+    log("SYSTEM", "wplacer", `🛡️ TOKEN_MANAGER: Invalidating token. ${this.tokenQueue.length} tokens remaining.`);
+
+    if (this.tokenQueue.length === 0) {
+      this.isTokenNeeded = true;
+      this._lastNeededAt = Date.now();
+      notifyTokenNeeded();
+    }
+  },
+  consumeToken() {
+    if (this.tokenQueue.length > 0) {
+      this.tokenQueue.shift();
+      log("SYSTEM", "wplacer", `🛡️ TOKEN_MANAGER: Consumed token after success. ${this.tokenQueue.length} tokens remaining.`);
+    }
+    if (this.tokenQueue.length === 0) {
+      this.isTokenNeeded = true;
+      this._lastNeededAt = Date.now();
+      notifyTokenNeeded();
+    }
+  }
+};
+
+// --- Error logging wrapper ---
+function logUserError(error, id, name, context) {
+  const message = error?.message || "An unknown error occurred.";
+
+  // Handle proxy connection errors
+  if (message.includes("reqwest::Error") || message.includes("hyper_util::client::legacy::Error") ||
+    message.includes("Connection refused") || message.includes("timeout") ||
+    message.includes("ENOTFOUND") || message.includes("ECONNREFUSED")) {
+    log(id, name, `❌ Proxy connection failed - check proxy IP/port or try different proxy (or IP not whitelisted)`);
+    return;
+  }
+
+  // Handle network-related errors
+  if (message.includes("Network error") || message.includes("Failed to fetch") ||
+    message.includes("socket hang up") || message.includes("ECONNRESET")) {
+    log(id, name, `❌ Network error - check proxy IP/port or try different proxy (or IP not whitelisted)`);
+    return;
+  }
+
+  // Simplify error messages for common auth issues
+  if (message.includes("(401/403)") || /Unauthorized/i.test(message) || /cookies\s+are\s+invalid/i.test(message)) {
+    // Log original message to avoid masking connection problems as auth issues
+    log(id, name, `❌ ${message}`);
+    return;
+  }
+
+  if (message.includes("(1015)") || message.includes("rate-limited")) {
+    log(id, name, `❌ Rate limited (1015) - waiting before retry`);
+    return;
+  }
+
+  if (message.includes("(500)") || message.includes("(502)")) {
+    log(id, name, `❌ Server error (500/502) - retrying later (maybe need to relogin)`);
+    return;
+  }
+
+  if (error?.name === "SuspensionError") {
+    log(id, name, `🛑 Account suspended (451)`);
+    return;
+  }
+
+  // For other errors, show simplified message
+  const simpleMessage = message.replace(/\([^)]+\)/g, '').replace(/Error:/g, '').trim();
+  log(id, name, ` ${simpleMessage}`);
+}
+
+// --- Template Manager ---
+class TemplateManager {
+  constructor(name, templateData, coords, canBuyCharges, canBuyMaxCharges, antiGriefMode, userIds, paintTransparentPixels = false, skipPaintedPixels = false, outlineMode = false) {
+    this.name = name;
+    this.template = templateData;
+    this.coords = coords;
+    this.canBuyCharges = !!canBuyCharges;
+    this.canBuyMaxCharges = !!canBuyMaxCharges;
+    this.autoBuyNeededColors = false;
+    this.antiGriefMode = !!antiGriefMode;
+    this.userIds = userIds;
+    this.userQueue = [...userIds];
+    // throttle for opportunistic resync
+    this._lastResyncAt = 0;
+    this._resyncCooldownMs = 3000;
+
+
+    this.skipPaintedPixels = !!skipPaintedPixels;
+    this.outlineMode = !!outlineMode;
+    this.paintTransparentPixels = !!paintTransparentPixels; // NEW: per-template flag like old version
+    this.burstSeeds = null; // persist across runs
+
+    // Heatmap settings (per template)
+    this.heatmapEnabled = false;
+    this.heatmapLimit = 10000; // default limit
+
+    this.running = false;
+    this._sleepResolver = null;
+    this.status = "Waiting to be started.";
+    this.masterId = this.userIds[0];
+    this.masterName = users[this.masterId]?.name || "Unknown";
+
+    // visible counters (optional)
+    this.totalPixels = this.template?.data ? this.template.data.flat().filter((p) => (this.paintTransparentPixels ? p >= 0 : p > 0)).length : 0;
+    this.pixelsRemaining = this.totalPixels;
+
+    // premium colors in template cache
+    this.templatePremiumColors = this._computeTemplatePremiumColors();
+    // approximate per-user droplets projection
+    this.userProjectedDroplets = {}; // userId -> number
+    this._premiumsStopLogged = false;
+
+    // Summary throttling to avoid heavy pre-check before every turn
+    this._lastSummary = null;
+    this._lastSummaryAt = 0;
+    this._summaryMinIntervalMs = Math.max(2 * (currentSettings.accountCooldown || 15000), 20000);
+    this._lastPaintedAt = 0;
+    this._lastRunnerId = null;
+    this._lastSwitchAt = 0;
+    this._initialScanned = false;
+    this._wasMonitoring = false; // when antiGrief monitoring just switched back to active, skip waits
+  }
+  interruptSleep() {
+    try { if (this._sleepResolver) this._sleepResolver(); } catch (_) { }
+  }
+
+  async _sleepInterruptible(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    await new Promise((resolve) => {
+      this._sleepResolver = resolve;
+      setTimeout(resolve, ms);
+    });
+    this._sleepResolver = null;
+  }
+
+
+  _computeTemplatePremiumColors() {
+    try {
+      const set = new Set();
+      const t = this.template;
+      if (!t?.data) return set;
+      for (let x = 0; x < t.width; x++) {
+        for (let y = 0; y < t.height; y++) {
+          const id = t.data?.[x]?.[y] | 0;
+          if (id >= 32 && id <= 63) set.add(id);
+        }
+      }
+      return set;
+    } catch { return new Set(); }
+  }
+
+  _hasPremium(bitmap, cid) {
+    if (cid < 32) return true;
+    const bit = cid - 32;
+    return ((bitmap | 0) & (1 << bit)) !== 0;
+  }
+
+  async _tryAutoBuyNeededColors() {
+    if (!this.autoBuyNeededColors || !this.templatePremiumColors || this.templatePremiumColors.size === 0) return;
+
+    const reserve = currentSettings.dropletReserve || 0;
+    const purchaseCooldown = currentSettings.purchaseCooldown || 5000;
+    const COLOR_COST = 2000; // per user note
+    const dummyTemplate = { width: 0, height: 0, data: [] };
+    const dummyCoords = [0, 0, 0, 0];
+
+    // 1) gather current candidates deterministically with logging per each
+    const candidates = [];
+    for (const userId of this.userIds) {
+      const u = users[userId]; if (!u) continue;
+      if (activeBrowserUsers.has(userId)) continue;
+      activeBrowserUsers.add(userId);
+      const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, this.name);
+      try {
+        await w.login(u.cookies); await w.loadUserInfo();
+        const rec = { id: userId, name: w.userInfo.name, droplets: Number(w.userInfo.droplets || 0), bitmap: Number(w.userInfo.extraColorsBitmap || 0) };
+        candidates.push(rec);
+      } catch (e) {
+        logUserError(e, userId, u?.name || `#${userId}`, "autobuy colors: load info");
+      } finally { activeBrowserUsers.delete(userId); }
+    }
+    if (candidates.length === 0) return;
+
+    // sort by current number of premium colors asc
+    const premiumCount = (bitmap) => {
+      let c = 0; for (let i = 0; i <= 31; i++) if ((bitmap & (1 << i)) !== 0) c++; return c;
+    };
+
+    // 2) for each required premium color in ascending order
+    const neededColors = Array.from(this.templatePremiumColors).sort((a, b) => a - b);
+    let purchasedAny = false;
+    const bought = [];
+    for (const cid of neededColors) {
+      // skip if at least one user already has color (so template can be painted with assignments)
+      const someoneHas = candidates.some(c => this._hasPremium(c.bitmap, cid));
+      if (someoneHas) continue;
+
+      const ordered = candidates
+        .filter(c => (c.droplets - reserve) >= COLOR_COST)
+        .sort((a, b) => premiumCount(a.bitmap) - premiumCount(b.bitmap) || (a.droplets - b.droplets));
+
+      if (ordered.length === 0) {
+        const needTotal = COLOR_COST + reserve;
+        log("SYSTEM", "wplacer", `[${this.name}] ⏭️ Skip auto-buy color #${cid}: insufficient droplets on all assigned accounts (need ${COLOR_COST} + ${reserve}(reserve) = ${needTotal}).`);
+        continue; // no funds now → defer
+      }
+
+      // try purchase on the most "underprivileged" user
+      const buyer = ordered[0];
+      if (activeBrowserUsers.has(buyer.id)) continue;
+      activeBrowserUsers.add(buyer.id);
+      const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, this.name);
+      try {
+        await w.login(users[buyer.id].cookies);
+        await w.loadUserInfo();
+        const before = Number(w.userInfo.droplets || 0);
+        if ((before - reserve) < COLOR_COST) { /* just in case */ throw new Error("insufficient_droplets"); }
+        // if already has (race), skip
+        if (this._hasPremium(Number(w.userInfo.extraColorsBitmap || 0), cid)) {
+          log(buyer.id, w.userInfo.name, `[${this.name}] ⏭️ Skip auto-buy color #${cid}: account already owns this color.`);
+          continue;
+        }
+        log(buyer.id, w.userInfo.name, `[${this.name}] 💰 Attempting to auto-buy premium color #${cid}. Cost 2000, droplets before: ${before}, reserve: ${reserve}.`);
+        await w.buyProduct(100, 1, cid);
+        await sleep(purchaseCooldown);
+        await w.loadUserInfo().catch(() => { });
+        log(buyer.id, w.userInfo.name, `[${this.name}] 🛒 Auto-bought premium color #${cid}. Droplets ${before} → ${w.userInfo?.droplets}`);
+        // reflect in candidates for subsequent colors
+        buyer.bitmap = Number(w.userInfo.extraColorsBitmap || (buyer.bitmap | (1 << (cid - 32))));
+        buyer.droplets = Number(w.userInfo?.droplets || (before - COLOR_COST));
+        purchasedAny = true;
+        bought.push(cid);
+      } catch (e) {
+        logUserError(e, buyer.id, users[buyer.id].name, `auto-purchase color #${cid}`);
+      } finally {
+        activeBrowserUsers.delete(buyer.id);
+      }
+    }
+    return { purchased: purchasedAny, bought };
+  }
+
+  async handleUpgrades(wplacer) {
+    await wplacer.loadUserInfo();
+
+    // 1) Buy Max Charge Upgrades if enabled
+    if (this.canBuyMaxCharges) {
+      const affordableDroplets = wplacer.userInfo.droplets - currentSettings.dropletReserve;
+      const amountToBuy = Math.floor(affordableDroplets / 500);
+      if (amountToBuy > 0) {
+        log(wplacer.userInfo.id, wplacer.userInfo.name, `💰 Attempting to buy ${amountToBuy} max charge upgrade(s).`);
+        try {
+          await wplacer.buyProduct(70, amountToBuy);
+          await sleep(currentSettings.purchaseCooldown);
+          await wplacer.loadUserInfo();
+        } catch (error) {
+          logUserError(error, wplacer.userInfo.id, wplacer.userInfo.name, "purchase max charge upgrades");
+        }
+      }
+    }
+
+    // 2) Buy Pixel Charges (500) if enabled and affordable
+    if (this.canBuyCharges) {
+      try {
+        const reserve = Number(currentSettings.dropletReserve || 0);
+        const droplets = Math.max(0, Number(wplacer?.userInfo?.droplets || 0));
+        const affordableDroplets = Math.max(0, droplets - reserve);
+        if (affordableDroplets >= 500) {
+          const packs = Math.floor(affordableDroplets / 500);
+          const target = Math.min(Math.ceil(Math.max(0, this.pixelsRemaining | 0) / 30), packs);
+          if (target > 0) {
+            log(wplacer.userInfo.id, wplacer.userInfo.name, `💰 Attempting to buy pixel charges (${target}×500) before painting...`);
+            await wplacer.buyProduct(80, target);
+            await sleep(currentSettings.purchaseCooldown || 0);
+            try { await wplacer.loadUserInfo(); } catch (_) { }
+          }
+        }
+      } catch (error) {
+        logUserError(error, wplacer.userInfo.id, wplacer.userInfo.name, "purchase pixel charges");
+      }
+    }
+  }
+
+  async _performPaintTurn(wplacer) {
+    while (this.running) {
+      try {
+        // wplacer.token = await TokenManager.getToken();
+        // Pull latest pawtect token, if any
+        // try { wplacer.pawtect = globalThis.__wplacer_last_pawtect || null; } catch { }
+        const painted = await wplacer.paint(currentSettings.drawingMethod);
+        if(typeof painted === 'number' && painted > 0)
+        {
+          log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] ⏰ Estimated time left: ~${this.formatTime((this.pixelsRemaining - painted) / this.userIds.length * 30)}`); //30 seconds for 1 pixel
+        }
+        // save back burst seeds if used
+        this.burstSeeds = wplacer._burstSeeds ? wplacer._burstSeeds.map((s) => ({ gx: s.gx, gy: s.gy })) : null;
+        saveTemplates();
+        // try { TokenManager.consumeToken(); } catch { }
+        return painted;
+      } catch (error) {
+        if (error.name === "SuspensionError") {
+          const suspendedUntilDate = new Date(error.suspendedUntil).toLocaleString();
+          const uid = wplacer.userInfo.id;
+          const uname = wplacer.userInfo.name;
+          // mark user suspended
+          users[uid].suspendedUntil = error.suspendedUntil;
+          saveUsers();
+          // remove from drawing participants for this template (normalize id types)
+          const uidStr = String(uid);
+          this.userIds = (this.userIds || []).filter((id) => String(id) !== uidStr);
+          this.userQueue = (this.userQueue || []).filter((id) => String(id) !== uidStr);
+          try { saveTemplates(); } catch (_) { }
+          // log informative message in English
+          log(uid, uname, `[${this.name}] 🛑 Account suspended until ${suspendedUntilDate}. Removed from the template list.`);
+          // also invalidate the currently held token so it won't be reused
+          // try { TokenManager.invalidateToken(); } catch (_) { }
+          return; // end this user's turn
+        }
+        if (error.message === "REFRESH_TOKEN") {
+          log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🔄 Token expired/invalid. Trying next token...`);
+          // TokenManager.invalidateToken();
+          await sleep(1000);
+          continue;
+        }
+        // Delegate all errors to unified logger to keep original reason
+        logUserError(error, wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] paint turn`);
+        return 0;
+        throw error;
+      }
+    }
+  }
+
+  //Used for time estimation, converting seconds value to more readable format
+  formatTime(seconds) {
+    const d = Math.floor(seconds / (3600 * 24));
+    const h = Math.floor((seconds % (3600 * 24)) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+
+    let parts = [];
+    if (d > 0) parts.push(d + "d");
+    if (h > 0) parts.push(h + "h");
+    if (m > 0) parts.push(m + "m");
+    if (s > 0 || parts.length === 0) parts.push(s + "s");
+
+    return parts.join(" ");
+  }
+
+  async start() {
+    this.running = true;
+    this.status = "Started.";
+    log("SYSTEM", "wplacer", `▶️ Starting template "${this.name}"...`);
+
+    try {
+
+      if (!this._initialScanned) {
+        const cooldown = Math.max(0, Number(currentSettings.accountCheckCooldown || 0));
+        const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+        if (useParallel) {
+          const candidates = this.userIds.filter(uid => {
+            const rec = users[uid];
+            if (!rec) return false;
+            if (rec.suspendedUntil && Date.now() < rec.suspendedUntil) return false;
+            if (activeBrowserUsers.has(uid)) return false;
+            return true;
+          });
+          const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+          const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+          log("SYSTEM", "wplacer", `[${this.name}] 🔍 Initial scan (parallel): ${candidates.length} accounts (concurrency=${concurrency}, proxies=${loadedProxies.length}).`);
+          let index = 0;
+          const worker = async () => {
+            for (; ;) {
+              if (!this.running) break;
+              const myIndex = index++;
+              if (myIndex >= candidates.length) break;
+              const uid = candidates[myIndex];
+              const rec = users[uid];
+              if (!rec) continue;
+              if (activeBrowserUsers.has(uid)) continue;
+              activeBrowserUsers.add(uid);
+              const w = new WPlacer(this.template, this.coords, currentSettings, this.name, this.paintTransparentPixels, this.burstSeeds);
+              try {
+                await w.login(rec.cookies); await w.loadUserInfo();
+                const cnt = Math.floor(Number(w.userInfo?.charges?.count || 0));
+                const mx = Math.floor(Number(w.userInfo?.charges?.max || 0));
+                log(w.userInfo.id, w.userInfo.name, `[${this.name}] 🔁 Cache update: charges ${cnt}/${mx}`);
+              }
+              catch (e) { logUserError(e, uid, rec?.name || `#${uid}`, "initial user scan"); }
+              finally { activeBrowserUsers.delete(uid); }
+              if (!this.running) break;
+              if (cooldown > 0) await this._sleepInterruptible(cooldown);
+            }
+          };
+          await Promise.all(Array.from({ length: concurrency }, () => worker()));
+          log("SYSTEM", "wplacer", `[${this.name}] ✅ Initial scan finished (parallel).`);
+        } else {
+          log("SYSTEM", "wplacer", `[${this.name}] 🔍 Initial scan: starting (${this.userIds.length} accounts). Cooldown=${cooldown}ms`);
+          for (const uid of this.userIds) {
+            if (!this.running) break;
+            const rec = users[uid]; if (!rec) continue;
+            if (rec.suspendedUntil && Date.now() < rec.suspendedUntil) continue;
+            if (activeBrowserUsers.has(uid)) continue;
+            activeBrowserUsers.add(uid);
+            const w = new WPlacer(this.template, this.coords, currentSettings, this.name, this.paintTransparentPixels, this.burstSeeds, this.skipPaintedPixels, this.outlineMode);
+            try {
+              await w.login(rec.cookies); await w.loadUserInfo();
+              const cnt = Math.floor(Number(w.userInfo?.charges?.count || 0));
+              const mx = Math.floor(Number(w.userInfo?.charges?.max || 0));
+              log(w.userInfo.id, w.userInfo.name, `[${this.name}] 🔁 Cache update: charges ${cnt}/${mx}`);
+            }
+            catch (e) { logUserError(e, uid, rec?.name || `#${uid}`, "initial user scan"); }
+            finally { activeBrowserUsers.delete(uid); }
+            if (!this.running) break;
+            if (cooldown > 0) await this._sleepInterruptible(cooldown);
+          }
+          log("SYSTEM", "wplacer", `[${this.name}] ✅ Initial scan finished.`);
+        }
+        this._initialScanned = true;
+      }
+
+      while (this.running) {
+        // Throttled check of remaining pixels using the master account
+        let summaryForTurn = null;
+        const needFreshSummary = !this._lastSummary || (Date.now() - this._lastSummaryAt) >= this._summaryMinIntervalMs;
+        if (needFreshSummary) {
+          const checkWplacer = new WPlacer(this.template, this.coords, currentSettings, this.name, this.paintTransparentPixels, this.burstSeeds, this.skipPaintedPixels, this.outlineMode);
+          try {
+            await checkWplacer.login(users[this.masterId].cookies);
+            const summary = await checkWplacer.mismatchesSummary();
+            summaryForTurn = summary;
+            this._lastSummary = summary;
+            this._lastSummaryAt = Date.now();
+            this.pixelsRemaining = summary.total;
+            // Initialize and persist shared burst seeds once per template for burst-family modes
+            try {
+              const burstFamily = new Set(["burst", "colors-burst-rare", "outline-then-burst", "burst-mixed"]);
+              if (burstFamily.has(currentSettings.drawingMethod)) {
+                const desired = Math.max(1, Math.min(Number(currentSettings?.seedCount ?? 2), 16));
+                if (!this.burstSeeds || this.burstSeeds.length !== desired) {
+                  const mm = checkWplacer._getMismatchedPixels();
+                  if (Array.isArray(mm) && mm.length > 0) {
+                    this.burstSeeds = checkWplacer._pickBurstSeeds(mm, desired);
+                    saveTemplates();
+                  }
+                }
+              }
+            } catch (_) { }
+            if (this.autoBuyNeededColors) {
+              if (summary.total === 0) {
+                // nothing to do
+              } else if (summary.basic === 0 && summary.premium > 0) {
+                // only premium remain — check funds and stop if none can buy
+                // first, try auto-buy immediately to avoid false stop
+                let autoRes = { purchased: false, bought: [] };
+                try { autoRes = await this._tryAutoBuyNeededColors() || autoRes; } catch (_) { }
+
+                // re-evaluate ability to buy / own after purchases
+                const reserve = currentSettings.dropletReserve || 0;
+                const dummyTemplate = { width: 0, height: 0, data: [] };
+                const dummyCoords = [0, 0, 0, 0];
+                let anyCanBuy = false;
+                let anyOwnsRemaining = false;
+                for (const uid of this.userIds) {
+                  if (activeBrowserUsers.has(uid)) continue;
+                  activeBrowserUsers.add(uid);
+                  const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, this.name);
+                  try {
+                    await w.login(users[uid].cookies);
+                    await w.loadUserInfo();
+                    if ((Number(w.userInfo.droplets || 0) - reserve) >= 2000) { anyCanBuy = true; }
+                    const bitmap = Number(w.userInfo.extraColorsBitmap || 0);
+                    for (const cid of Array.from(summary.premiumColors)) {
+                      if (cid >= 32 && ((bitmap & (1 << (cid - 32))) !== 0)) { anyOwnsRemaining = true; break; }
+                    }
+                  }
+                  catch { } finally { activeBrowserUsers.delete(uid); }
+                  if (anyCanBuy) break;
+                }
+                if (anyOwnsRemaining) {
+                  log("SYSTEM", "wplacer", `[${this.name}] ℹ️ Only premium pixels remain, but some are already owned. Proceeding to paint owned premium while waiting for funds to buy others.`);
+                } else if (!anyCanBuy) {
+                  const list = Array.from(summary.premiumColors).sort((a, b) => a - b).join(', ');
+                  const reserve2 = currentSettings.dropletReserve || 0;
+                  const needTotal = 2000 + reserve2;
+                  log("SYSTEM", "wplacer", `[${this.name}] ⛔ Template stopped: Only premium pixels remain (${summary.premium} px, colors: ${list}), and none of assigned accounts have enough droplets to purchase (need 2000 + ${reserve2}(reserve) = ${needTotal}).`);
+                  this.status = "Finished.";
+                  this.running = false;
+                  break;
+                }
+                if (autoRes.purchased) {
+                  this.pixelsRemaining = Math.max(1, summary.premium);
+                } else {
+                  this.pixelsRemaining = summary.premium;
+                }
+              }
+            }
+          } catch (error) {
+            logUserError(error, this.masterId, this.masterName, "check pixels left");
+            await this._sleepInterruptible(60000);
+            continue;
+          }
+        } else {
+          summaryForTurn = this._lastSummary;
+          this.pixelsRemaining = summaryForTurn?.total ?? this.pixelsRemaining;
+        }
+
+        if (this.pixelsRemaining === 0) {
+          // Special log: when only premium pixels remain and no funds to auto-buy
+          if (this.autoBuyNeededColors && this.templatePremiumColors && this.templatePremiumColors.size > 0) {
+            const hasAnyBasic = (() => {
+              try {
+                const t = this.template;
+                for (let x = 0; x < t.width; x++) {
+                  for (let y = 0; y < t.height; y++) {
+                    const id = t.data?.[x]?.[y] | 0; if (id > 0 && id < 32) return true;
+                  }
+                }
+              } catch { }
+              return false;
+            })();
+            if (!hasAnyBasic) {
+              const reserve = currentSettings.dropletReserve || 0;
+              const dummyTemplate = { width: 0, height: 0, data: [] };
+              const dummyCoords = [0, 0, 0, 0];
+              let anyCanBuy = false;
+              for (const uid of this.userIds) {
+                if (activeBrowserUsers.has(uid)) continue;
+                activeBrowserUsers.add(uid);
+                const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, this.name);
+                try { await w.login(users[uid].cookies); await w.loadUserInfo(); if ((Number(w.userInfo.droplets || 0) - reserve) >= 2000) { anyCanBuy = true; } }
+                catch { } finally { activeBrowserUsers.delete(uid); }
+                if (anyCanBuy) break;
+              }
+              if (!anyCanBuy) {
+                log("SYSTEM", "wplacer", `[${this.name}] ⛔ Stopping: Only premium pixels remain and none of assigned accounts have enough droplets to purchase required colors.`);
+              }
+            }
+          }
+          if (this.antiGriefMode) {
+            this.status = "Monitoring for changes.";
+            log("SYSTEM", "wplacer", `[${this.name}] 🖼 Template complete. Monitoring... Next check in ${currentSettings.antiGriefStandby / 60000} min.`);
+            this._wasMonitoring = true;
+            await this._sleepInterruptible(currentSettings.antiGriefStandby);
+            continue;
+          } else {
+            log("SYSTEM", "wplacer", `[${this.name}] 🖼 Template finished!`);
+            this.status = "Finished.";
+            this.running = false;
+            break;
+          }
+        }
+
+        if (this.userQueue.length === 0) this.userQueue = [...this.userIds];
+
+        let resyncScheduled = false;
+        const nowSel = Date.now();
+        let bestUserId = null;
+        let bestPredicted = null;
+        let msWaitUntilNextUser = null; // Sei - smarter waiting
+
+        const candidates = this.userIds
+          .filter((uid) => {
+            const rec = users[uid];
+            if (!rec) return false;
+            if (rec.suspendedUntil && nowSel < rec.suspendedUntil) return false;
+            if (rec.authFailureUntil && nowSel < rec.authFailureUntil) return false;
+            if (activeBrowserUsers.has(uid)) return false;
+            return true;
+          })
+          .map((uid) => ({ uid, pred: ChargeCache.predict(uid, nowSel) }))
+          .map((o) => ({ uid: o.uid, count: Math.floor(o.pred?.count || 0), max: Math.floor(o.pred?.max || 0) }))
+          .sort((a, b) => b.count - a.count || b.max - a.max);
+
+        if (candidates.length) {
+          const top = candidates.slice(0, Math.min(3, candidates.length)).map(c => `#${c.uid} (${c.count}/${c.max})`).join(', ');
+          log("SYSTEM", "wplacer", `[${this.name}] 📊 Queue preview (top): ${top}`);
+        } else {
+          log("SYSTEM", "wplacer", `[${this.name}] 📊 Queue preview: empty candidates.`);
+        }
+
+        for (const { uid: userId } of candidates) {
+          const rec = users[userId];
+          if (!rec) continue;
+          if (rec.suspendedUntil && nowSel < rec.suspendedUntil) continue;
+          if (rec.authFailureUntil && nowSel < rec.authFailureUntil) continue;
+          if (activeBrowserUsers.has(userId)) continue;
+
+          if (!resyncScheduled && ChargeCache.stale(userId, nowSel) && (nowSel - this._lastResyncAt) >= this._resyncCooldownMs) {
+            resyncScheduled = true;
+            this._lastResyncAt = nowSel;
+            activeBrowserUsers.add(userId);
+            const w = new WPlacer(this.template, this.coords, currentSettings, this.name);
+            log(userId, rec.name, `[${this.name}] 🔄 Background resync started.`);
+            w.login(rec.cookies)
+              .then(() => { try { log(userId, rec.name, `[${this.name}] ✅ Background resync finished.`); } catch { } })
+              .catch((e) => { logUserError(e, userId, rec.name, "opportunistic resync"); try { log(userId, rec.name, `[${this.name}] ❌ Background resync finished (error). Try to re-add the account.`); } catch { } })
+              .finally(() => activeBrowserUsers.delete(userId));
+          }
+
+          const p = ChargeCache.predict(userId, nowSel);
+          if (!p) continue;
+          const threshold = currentSettings.alwaysDrawOnCharge ? 1 : Math.max(1, Math.floor(p.max * currentSettings.chargeThreshold));
+          if (Math.floor(p.count) >= threshold) {
+            if (!bestPredicted || Math.floor(p.count) > Math.floor(bestPredicted.count)) {
+              bestPredicted = p; bestUserId = userId;
+            }
+          }
+
+          // Sei - if no users are ready, determine the minimum time we need to wait before checking again.
+          else {
+            const needBeforeReady = Math.floor(p.max * currentSettings.chargeThreshold);
+            if (msWaitUntilNextUser == null || msWaitUntilNextUser.timeToReady > Math.floor(needBeforeReady - p.count) * 30_000) {
+              msWaitUntilNextUser = {
+                'name': rec.name,
+                'timeToReady': Math.floor(needBeforeReady - p.count) * 30_000
+              };
+            }
+          }
+        }
+
+        const foundUserForTurn = bestUserId;
+
+        if (foundUserForTurn) {
+          if (activeBrowserUsers.has(foundUserForTurn)) {
+            await sleep(500);
+            continue;
+          }
+
+          const nowRun = Date.now();
+          if (!this._wasMonitoring && this._lastRunnerId && this._lastRunnerId !== foundUserForTurn) {
+            const passed = nowRun - this._lastSwitchAt;
+            const ac = currentSettings.accountCooldown || 0;
+            if (passed < ac) {
+              const remain = ac - passed;
+              log("SYSTEM", "wplacer", `[${this.name}] ⏱️ Switching account cooldown: waiting ${duration(remain)}.`);
+              await this._sleepInterruptible(remain);
+            }
+          }
+          // Update _lastSwitchAt when switching accounts or on first run
+          if (this._lastRunnerId !== foundUserForTurn) {
+            this._lastSwitchAt = Date.now();
+            this._wasMonitoring = false;
+          }
+          activeBrowserUsers.add(foundUserForTurn);
+          const wplacer = new WPlacer(this.template, this.coords, currentSettings, this.name, this.paintTransparentPixels, this.burstSeeds, this.skipPaintedPixels, this.outlineMode);
+          // Wire cancellation: allow WPlacer to see when manager was stopped
+          try { wplacer.shouldStop = () => !this.running; } catch (_) { }
+          try {
+            const { id, name } = await wplacer.login(users[foundUserForTurn].cookies);
+            // Clear auth failure flag on successful login
+            if (users[foundUserForTurn].authFailureUntil) {
+              delete users[foundUserForTurn].authFailureUntil;
+              saveUsers();
+            }
+            this.status = `Running user ${name}#${id}`;
+
+            await this.handleUpgrades(wplacer);
+
+            const pred = ChargeCache.predict(foundUserForTurn, Date.now());
+            if (pred) log(id, name, `[${this.name}] ▶️ Start turn with predicted ${Math.floor(pred.count)}/${pred.max} charges.`);
+            const paintedNow = await this._performPaintTurn(wplacer);
+            if (typeof paintedNow === 'number' && paintedNow > 0) {
+              try { ChargeCache.consume(foundUserForTurn, paintedNow); } catch { }
+              this._lastPaintedAt = Date.now();
+              if (this._lastSummary) {
+                this._lastSummary.total = Math.max(0, (this._lastSummary.total | 0) - paintedNow);
+              }
+            }
+            else {
+              try {
+                log(id, name, `[${this.name}] ℹ️ Nothing painted. Skipping this turn and retrying soon.`);
+              } catch (_) { }
+              if (!this._wasMonitoring) {
+                await this._sleepInterruptible(5000);
+              }
+            }
+            // cache any new seeds
+            this.burstSeeds = wplacer._burstSeeds ? wplacer._burstSeeds.map((s) => ({ gx: s.gx, gy: s.gy })) : this.burstSeeds;
+            saveTemplates();
+            //await this.handleUpgrades(wplacer);
+          } catch (error) {
+            // Handle authentication errors gracefully
+            if (error.message && (error.message.includes("Authentication failed (401)") || error.message.includes("Authentication expired"))) {
+              const userName = users[foundUserForTurn]?.name || `#${foundUserForTurn}`;
+              log(foundUserForTurn, userName, `[${this.name}] ❌ Authentication failed (401) - skipping user temporarily`);
+              
+              // Temporarily exclude user from queue for 5 minutes to avoid repeated auth failures
+              if (!users[foundUserForTurn].authFailureUntil) {
+                users[foundUserForTurn].authFailureUntil = Date.now() + (5 * 60 * 1000); // 5 minutes
+                saveUsers();
+              }
+            } else {
+              logUserError(error, foundUserForTurn, users[foundUserForTurn]?.name || `#${foundUserForTurn}`, "perform paint turn");
+            }
+          } finally {
+            activeBrowserUsers.delete(foundUserForTurn);
+          }
+
+          if (this._lastRunnerId !== foundUserForTurn) {
+            this._lastRunnerId = foundUserForTurn;
+            this._lastSwitchAt = Date.now();
+          }
+        } else {
+
+          try { if (this.autoBuyNeededColors) { await this._tryAutoBuyNeededColors(); } } catch { }
+
+          // Buy charges if allowed (master only)
+          if (this.canBuyCharges && !activeBrowserUsers.has(this.masterId)) {
+            activeBrowserUsers.add(this.masterId);
+            const chargeBuyer = new WPlacer(this.template, this.coords, currentSettings, this.name, this.paintTransparentPixels, this.burstSeeds, this.skipPaintedPixels, this.outlineMode);
+            try {
+              await chargeBuyer.login(users[this.masterId].cookies);
+              const affordableDroplets = chargeBuyer.userInfo.droplets - currentSettings.dropletReserve;
+              if (affordableDroplets >= 500) {
+                const amountToBuy = Math.min(Math.ceil(this.pixelsRemaining / 30), Math.floor(affordableDroplets / 500));
+                if (amountToBuy > 0) {
+                  log(this.masterId, this.masterName, `[${this.name}] 💰 Attempting to buy pixel charges...`);
+                  await chargeBuyer.buyProduct(80, amountToBuy);
+                  await sleep(currentSettings.purchaseCooldown);
+                }
+              }
+            } catch (error) {
+              logUserError(error, this.masterId, this.masterName, "attempt to buy pixel charges");
+            } finally { activeBrowserUsers.delete(this.masterId); }
+          }
+
+
+          const now2 = Date.now();
+          const waits = this.userQueue.map((uid) => {
+            const p = ChargeCache.predict(uid, now2);
+            if (!p) return 15_000;
+            const threshold = currentSettings.alwaysDrawOnCharge ? 1 : Math.max(1, Math.floor(p.max * currentSettings.chargeThreshold));
+            const deficit = Math.max(0, threshold - Math.floor(p.count));
+            return deficit * (p.cooldownMs || 30_000);
+          });
+
+          // Sei - Instead of refreshing every 30 seconds, why don't we only refresh when we need to???
+          let waitTime = msWaitUntilNextUser?.timeToReady ?? 10_000;
+          // If "Always draw when at least one charge is available" is enabled,
+          // do not wait the full predicted time. Recheck within 60s so at least ~2 pixels can restore.
+          if (currentSettings.alwaysDrawOnCharge) {
+            waitTime = Math.min(waitTime, 60_000);
+          }
+          //let waitTime = (waits.length ? Math.min(...waits) : 10_000) + 800;
+          //const maxWait = Math.max(10_000, Math.floor((currentSettings.accountCooldown || 15000) * 1.5));
+          //waitTime = Math.min(waitTime, maxWait);
+          this.status = `Waiting for charges.`;
+          log("SYSTEM", "wplacer", `[${this.name}] ⏳ No users ready. Waiting for next available user${msWaitUntilNextUser ? ` (${msWaitUntilNextUser.name})` : ''}: ${duration(waitTime)}.`);
+          await this._sleepInterruptible(waitTime);
+        }
+      }
+    } finally {
+      if (this.status !== "Finished.") {
+        this.status = "Stopped.";
+      }
+    }
+  }
+}
+
+// --- Express App ---
+const app = express();
+app.use(cors());
+app.use(express.static("public"));
+app.use('/data', express.static('data'));
+app.use(express.json({ limit: Infinity }));
+
+// SSE endpoint for live logs of current session
+app.get("/logs/stream", (req, res) => {
+  try {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+    res.write(':ok\n\n');
+    try {
+      // send backlog first
+      const snapshot = recentLogs.slice(-1000);
+      for (const item of snapshot) {
+        res.write(`data: ${JSON.stringify(item)}\n\n`);
+      }
+    } catch (_) { }
+    sseClients.push(res);
+    req.on('close', () => {
+      const idx = sseClients.indexOf(res);
+      if (idx !== -1) sseClients.splice(idx, 1);
+    });
+  } catch (_) { try { res.end(); } catch { } }
+});
+
+// Global express error handler (keeps server alive and logs)
+app.use((err, req, res, next) => {
+  try {
+    console.error("[Express] error:", err?.message || err);
+    appendFileSync(path.join(dataDir, `errors.log`), `[${new Date().toLocaleString()}] (Express) ${err?.stack || err}\n`);
+  } catch (_) { }
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// --- API: tokens ---
+app.get("/token-needed/long", (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  let done = false;
+  const finish = (needed) => { if (done) return; done = true; res.end(JSON.stringify({ needed })); };
+  const timer = setTimeout(() => finish(false), 60000);
+  const fn = () => { clearTimeout(timer); finish(true); };
+  longWaiters.add(fn);
+  req.on("close", () => { longWaiters.delete(fn); clearTimeout(timer); });
+  if (TokenManager.isTokenNeeded) fn();
+});
+app.get("/token-needed", (req, res) => {
+  res.json({ needed: TokenManager.isTokenNeeded });
+});
+app.post("/t", (req, res) => {
+  const { t, pawtect, fp } = req.body || {};
+  if (!t) return res.sendStatus(400);
+  TokenManager.setToken(t);
+  try {
+    if (pawtect && typeof pawtect === "string") globalThis.__wplacer_last_pawtect = pawtect;
+    if (fp && typeof fp === "string") globalThis.__wplacer_last_fp = fp;
+  } catch { }
+  res.sendStatus(200);
+});
+
+// --- API: users ---
+const getJwtExp = (j) => {
+  try {
+    const p = j.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = JSON.parse(Buffer.from(p, 'base64').toString('utf8'));
+    return typeof json.exp === 'number' ? json.exp : null;
+  } catch {
+    return null;
+  }
+};
+
+// --- API: queue ---
+app.get("/queue", async (req, res) => {
+  try {
+    const now = Date.now();
+    const queueData = [];
+    let readyCount = 0;
+    let totalCount = 0;
+
+    for (const [id, user] of Object.entries(users)) {
+      // if (user.disabled) continue;
+      
+      totalCount++;
+      
+      const prediction = ChargeCache.predict(id, now);
+      const isSuspended = user.suspendedUntil && now < user.suspendedUntil;
+      const isActive = activeBrowserUsers.has(id);
+      
+      let status = 'waiting';
+      let cooldownTime = null;
+      
+      if (isSuspended) {
+        status = 'suspended';
+        cooldownTime = Math.ceil((user.suspendedUntil - now) / 1000);
+      } else if (isActive) {
+        status = 'active';
+      } else if (prediction) {
+        const threshold = currentSettings.alwaysDrawOnCharge ? 1 : Math.max(1, Math.floor(prediction.max * currentSettings.chargeThreshold));
+        if (Math.floor(prediction.count) >= threshold) {
+          status = 'ready';
+          readyCount++;
+        } else {
+          status = 'cooldown';
+          const deficit = Math.max(0, threshold - Math.floor(prediction.count));
+          cooldownTime = deficit * (prediction.cooldownMs || 30000) / 1000;
+        }
+      } else {
+        status = 'no-data';
+      }
+
+      queueData.push({
+        id: id,
+        name: user.name || `User #${id}`,
+        charges: prediction ? {
+          current: Math.floor(prediction.count),
+          max: prediction.max,
+          percentage: Math.round((prediction.count / prediction.max) * 100)
+        } : null,
+        status: status,
+        cooldownTime: cooldownTime,
+        retryCount: user.retryCount || 0,
+        maxRetryCount: currentSettings.maxRetryCount,
+        lastErrorTime: user.lastErrorTime || null
+      });
+    }
+
+    queueData.sort((a, b) => {
+      // Define priority order: active > ready > cooldown > waiting > suspended > no-data
+      const statusPriority = {
+        'active': 1,
+        'ready': 2,
+        'cooldown': 3,
+        'waiting': 4,
+        'suspended': 5,
+        'no-data': 6
+      };
+      
+      const aPriority = statusPriority[a.status] || 7;
+      const bPriority = statusPriority[b.status] || 7;
+      
+      // First sort by status priority
+      if (aPriority !== bPriority) {
+        return aPriority - bPriority;
+      }
+      
+      // Within same status, sort by charges (higher first)
+      if (a.charges && b.charges) {
+        return b.charges.current - a.charges.current;
+      }
+      
+      // If one has charges and other doesn't, prioritize the one with charges
+      if (a.charges && !b.charges) return -1;
+      if (!a.charges && b.charges) return 1;
+      
+      // Finally sort by ID for consistency
+      return a.id.localeCompare(b.id);
+    });
+
+    res.json({
+      success: true,
+      data: {
+        users: queueData,
+        summary: {
+          total: totalCount,
+          ready: readyCount,
+          waiting: queueData.filter(u => u.status === 'waiting').length,
+          cooldown: queueData.filter(u => u.status === 'cooldown').length,
+          suspended: queueData.filter(u => u.status === 'suspended').length,
+          active: queueData.filter(u => u.status === 'active').length,
+          noData: queueData.filter(u => u.status === 'no-data').length
+        },
+        lastUpdate: now,
+        settings: {
+          chargeThreshold: currentSettings.chargeThreshold,
+          alwaysDrawOnCharge: currentSettings.alwaysDrawOnCharge
+        }
+      }
+    });
+  } catch (error) {
+    logUserError(error, "SYSTEM", "queue-preview", "get queue preview");
+    res.status(500).json({ error: "Failed to get queue preview" });
+  }
+});
+
+// --- API: Grief Monitoring ---
+app.get("/griefers", (_, res) => {
+  res.json({
+    success: true,
+    data: griefers,
+    count: griefers.length,
+    monitoringEnabled: currentSettings.griefMonitoringEnabled,
+    monitoringActive: griefCheckJob.active,
+    historyLoaded: 0
+  });
+});
+
+app.post("/griefers/monitoring", (req, res) => {
+  const { enabled } = req.body;
+  
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: "Missing or invalid 'enabled' parameter" });
+  }
+  
+  log("SYSTEM", "grief-monitor", `🔄 Toggling grief monitoring: ${enabled ? 'ON' : 'OFF'}`);
+  
+  currentSettings.griefMonitoringEnabled = enabled;
+  saveSettings(); // Save to settings.json
+  
+  if (enabled && !griefCheckJob.active) {
+    log("SYSTEM", "grief-monitor", "🚀 Starting grief monitoring...");
+    startGriefMonitoring();
+  } else if (!enabled && griefCheckJob.active) {
+    griefCheckJob.active = false;
+    log("SYSTEM", "grief-monitor", "⏹️ Grief monitoring disabled");
+  } else if (enabled && griefCheckJob.active) {
+    log("SYSTEM", "grief-monitor", "ℹ️ Grief monitoring already active");
+  } else {
+    log("SYSTEM", "grief-monitor", "ℹ️ Grief monitoring already disabled");
+  }
+  
+  res.json({ 
+    success: true, 
+    monitoringEnabled: currentSettings.griefMonitoringEnabled,
+    monitoringActive: griefCheckJob.active
+  });
+});
+
+app.post("/griefers", (req, res) => {
+  const { name, id, alliance, url, lat, lng, griefType, timestamp } = req.body;
+  
+  if (!name || !id) {
+    return res.status(400).json({ error: "Missing required fields: name, id" });
+  }
+  
+  const griefer = {
+    name,
+    id,
+    alliance: alliance || null,
+    url: url || null,
+    lat: lat || null,
+    lng: lng || null,
+    griefType: griefType || 'unknown',
+    timestamp: timestamp || Date.now(),
+    detectedAt: new Date().toISOString()
+  };
+  
+  const existingIndex = griefers.findIndex(g => g.id === id && g.name === name);
+  if (existingIndex >= 0) {
+    griefers[existingIndex] = griefer;
+  } else {
+    griefers.push(griefer);
+  }
+  
+  broadcastLog({
+    type: "griefer_detected",
+    data: griefer
+  });
+  
+  res.json({ success: true, griefer });
+});
+
+app.delete("/griefers", (req, res) => {
+  const clearedCount = griefers.length;
+  griefers = [];
+  try { existingGriefLocations.clear(); } catch (_) {}
+  saveGriefersToFile(); // Save to file
+  log("SYSTEM", "grief-monitor", `🗑️ Cleared all ${clearedCount} griefers from list`);
+  res.json({ success: true, message: "All griefers cleared" });
+});
+
+app.delete("/griefers/:id", (req, res) => {
+  const { id } = req.params;
+  const initialLength = griefers.length;
+  
+  // Convert both to string for comparison to handle type mismatch
+  griefers = griefers.filter(g => String(g.id) !== String(id));
+  
+  if (griefers.length < initialLength) {
+    try {
+      // Rebuild existing locations after delete to keep set consistent
+      existingGriefLocations = new Set(
+        griefers
+          .filter(g => typeof g.lat === 'number' && typeof g.lng === 'number')
+          .map(g => `${g.lat.toFixed(6)}_${g.lng.toFixed(6)}`)
+      );
+    } catch (_) {}
+    saveGriefersToFile(); // Save to file
+    log("SYSTEM", "grief-monitor", `🗑️ Removed griefer ${id} from list`);
+    res.json({ success: true, message: `Griefer ${id} removed` });
+  } else {
+    log("SYSTEM", "grief-monitor", `❌ Failed to remove griefer ${id} - not found`);
+    res.status(404).json({ error: "Griefer not found" });
+  }
+});
+
+// API: GET /griefers/export/csv
+app.get("/griefers/export/csv", (req, res) => {
+  try {
+    const csvHeader = "Name,ID,Location,Alliance,Detected,Template\n";
+    const csvRows = griefers.map(griefer => {
+      const name = griefer.name || '';
+      const id = griefer.id || '';
+      const location = griefer.url || 'None';
+      const alliance = griefer.alliance || 'None';
+      const detected = new Date(griefer.detectedAt).toLocaleString();
+      const template = griefer.templateName || 'Unknown';
+      
+      return `"${name}","${id}","${location}","${alliance}","${detected}","${template}"`;
+    }).join('\n');
+    
+    const csvContent = csvHeader + csvRows;
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="griefers_export.csv"');
+    res.send(csvContent);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/users", (_, res) => {
+  const out = JSON.parse(JSON.stringify(users));
+  for (const id of Object.keys(out)) {
+    if (!out[id]) continue;
+    if (out[id].cookies) delete out[id].cookies;
+    if (!out[id].expirationDate && users[id]?.cookies?.j) {
+      const exp = getJwtExp(users[id].cookies.j);
+      if (exp) out[id].expirationDate = exp;
+    }
+  }
+  res.json(out);
+});
+
+
+app.post("/user", async (req, res) => {
+  if (!req.body.cookies || !req.body.cookies.j) return res.sendStatus(400);
+  const wplacer = new WPlacer();
+  try {
+    const userInfo = await wplacer.login(req.body.cookies);
+    const exp = getJwtExp(req.body.cookies.j);
+    const profileNameRaw = typeof req.body?.profileName === "string" ? String(req.body.profileName) : "";
+    const shortLabelFromProfile = profileNameRaw.trim().slice(0, 40);
+    const prev = users[userInfo.id] || {};
+    users[userInfo.id] = {
+      ...prev,
+      name: userInfo.name,
+      cookies: req.body.cookies,
+      expirationDate: exp || prev?.expirationDate || null
+    };
+    if (shortLabelFromProfile) {
+      users[userInfo.id].shortLabel = shortLabelFromProfile;
+    }
+    saveUsers();
+    res.json(userInfo);
+  } catch (error) {
+    logUserError(error, "NEW_USER", "N/A", "add new user");
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/user/:id", async (req, res) => {
+  const userIdToDelete = req.params.id;
+  if (!userIdToDelete || !users[userIdToDelete]) return res.sendStatus(400);
+
+  const deletedUserName = users[userIdToDelete].name;
+  delete users[userIdToDelete];
+  saveUsers();
+  log("SYSTEM", "Users", `Deleted user ${deletedUserName}#${userIdToDelete}.`);
+
+  let templatesModified = false;
+  for (const templateId in templates) {
+    const template = templates[templateId];
+    const initialUserCount = template.userIds.length;
+    template.userIds = template.userIds.filter((id) => id !== userIdToDelete);
+
+    if (template.userIds.length < initialUserCount) {
+      templatesModified = true;
+      log("SYSTEM", "Templates", `Removed user ${deletedUserName}#${userIdToDelete} from template "${template.name}".`);
+      if (template.masterId === userIdToDelete) {
+        template.masterId = template.userIds[0] || null;
+        template.masterName = template.masterId ? users[template.masterId].name : null;
+      }
+      if (template.userIds.length === 0 && template.running) {
+        template.running = false;
+        log("SYSTEM", "wplacer", `[${template.name}] 🛑 Template stopped because it has no users left.`);
+      }
+    }
+  }
+  if (templatesModified) saveTemplates();
+  res.sendStatus(200);
+});
+
+app.get("/user/status/:id", async (req, res) => {
+  const { id } = req.params;
+  if (!users[id] || activeBrowserUsers.has(id)) return res.sendStatus(409);
+  activeBrowserUsers.add(id);
+  const wplacer = new WPlacer();
+  try {
+    const userInfo = await wplacer.login(users[id].cookies);
+    // If banned, return an explicit error with a distinct HTTP status code
+    if (userInfo && userInfo.banned === true) {
+      return res.status(423).json({ error: "❌ Account is suspended/banned." });
+    }
+    res.status(200).json(userInfo);
+  } catch (error) {
+    logUserError(error, id, users[id].name, "validate cookie");
+    const msg = String(error && error.message || "error").toLowerCase();
+    if (msg.includes("banned")) {
+      return res.status(423).json({ error: "❌ Account is suspended/banned." });
+    }
+    res.status(500).json({ error: error.message });
+  } finally {
+    activeBrowserUsers.delete(id);
+  }
+});
+
+// Cleanup expired users (by ids) with backup of users.json
+app.post("/users/cleanup-expired", (req, res) => {
+  try {
+    const removeIds = Array.isArray(req.body?.removeIds) ? req.body.removeIds.map(String) : [];
+    if (!removeIds || removeIds.length === 0) return res.status(400).json({ error: "no_selection" });
+
+    // Backup users.json
+    try {
+      const usersPath = path.join(dataDir, "users.json");
+      const backupPath = path.join(
+        usersBackupsDir,
+        `users.backup-${new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')}.json`
+      );
+      try { writeFileSync(backupPath, readFileSync(usersPath, "utf8")); } catch (_) { }
+
+      // Remove users
+      let removed = 0;
+      for (const id of removeIds) {
+        if (users[id]) {
+          const name = users[id].name;
+          delete users[id];
+          removed++;
+          try { log("SYSTEM", "Users", `Deleted expired user ${name}#${id}.`); } catch (_) { }
+        }
+      }
+      saveUsers();
+
+      // Strip removed users from templates, update master if needed, stop if none
+      let templatesModified = false;
+      for (const templateId in templates) {
+        const template = templates[templateId];
+        const before = template.userIds.length;
+        template.userIds = template.userIds.filter((uid) => !!users[uid]);
+        if (template.userIds.length < before) {
+          templatesModified = true;
+          if (template.masterId && !users[template.masterId]) {
+            template.masterId = template.userIds[0] || null;
+            template.masterName = template.masterId ? users[template.masterId].name : null;
+          }
+          if (template.userIds.length === 0 && template.running) {
+            template.running = false;
+            try { log("SYSTEM", "wplacer", `[${template.name}] 🛑 Template stopped because it has no users left.`); } catch (_) { }
+          }
+        }
+      }
+      if (templatesModified) saveTemplates();
+
+      const remaining = Object.keys(users).length;
+      return res.status(200).json({ success: true, removed, remaining, backup: path.basename(backupPath) });
+    } catch (e) {
+      return res.status(500).json({ error: String(e && e.message || e) });
+    }
+  } catch (e) {
+    return res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// --- API: update user profile (name/discord/showLastPixel) ---
+app.put("/user/:id/update-profile", async (req, res) => {
+  const { id } = req.params;
+  if (!users[id] || activeBrowserUsers.has(id)) return res.sendStatus(409);
+
+  // Always send all fields to backend, but validate here
+  const name = typeof req.body?.name === "string" ? String(req.body.name).trim() : "";
+  const discord = typeof req.body?.discord === "string" ? String(req.body.discord).trim() : "";
+  const showLastPixel = typeof req.body?.showLastPixel === "boolean" ? !!req.body.showLastPixel : !!users[id]?.showLastPixel;
+  const shortLabelRaw = typeof req.body?.shortLabel === "string" ? String(req.body.shortLabel) : "";
+  const shortLabel = shortLabelRaw.trim().slice(0, 40);
+
+  if (name && name.length > 15) return res.status(400).json({ error: "Name must be at most 15 characters" });
+  if (discord && discord.length > 15) return res.status(400).json({ error: "Discord must be at most 15 characters" });
+
+  // Always persist local-only field if provided
+  if (typeof req.body?.shortLabel === "string") {
+    users[id].shortLabel = shortLabel;
+  }
+
+  // Determine if remote update is needed
+  const willUpdateRemote = (name && name !== users[id].name) || (discord !== users[id].discord) || (showLastPixel !== !!users[id].showLastPixel);
+
+  if (!willUpdateRemote) {
+    saveUsers();
+    return res.status(200).json({ success: true, localOnly: true });
+  }
+
+  activeBrowserUsers.add(id);
+  const wplacer = new WPlacer();
+  try {
+    await wplacer.login(users[id].cookies);
+    const payload = { name, discord, showLastPixel };
+
+    const { status, data } = await wplacer.post("https://bplace.org/me/update", payload);
+    if (status === 200 && data && data.success) {
+      if (typeof name === "string" && name.length) { users[id].name = name; }
+      users[id].discord = discord;
+      users[id].showLastPixel = !!showLastPixel;
+      saveUsers();
+      res.status(200).json({ success: true });
+      log(id, users[id].name, `Updated profile (${Object.keys(payload).join(", ") || "no changes"}).`);
+    } else {
+      res.status(status || 500).json(data || { error: "Unknown error" });
+    }
+  } catch (error) {
+    logUserError(error, id, users[id].name, "update profile");
+    res.status(500).json({ error: error.message });
+  } finally {
+    activeBrowserUsers.delete(id);
+  }
+});
+
+// Open local Brave profile launcher (.bat) by user's shortLabel
+app.post("/user/:id/open-profile", (req, res) => {
+  try {
+    const { id } = req.params;
+    const u = users[id];
+    if (!u) return res.status(404).json({ error: "user_not_found" });
+    const short = String(u.shortLabel || "").trim();
+    if (!short) return res.status(400).json({ error: "no_profile_label" });
+
+    // D:\Projects\pixels\wplacer-main\v4\brave\data\launch-{PROFILE}.bat
+    const fileName = `launch-${short}.bat`;
+    const profilePath = path.resolve(process.cwd(), "..", "brave", "data", fileName);
+    if (!existsSync(profilePath)) {
+      return res.status(404).json({ error: "bat_not_found", path: profilePath });
+    }
+
+    // Robust Windows CMD invocation: call "fullpath.bat" [brave.exe]
+    try {
+      try { log("SYSTEM", "Profiles", `Launching: ${profilePath}`); } catch(_) {}
+      const batDir = path.dirname(profilePath);
+      const debug = String(req.query?.debug || "").trim() === "1";
+
+      // Try to detect Brave path and pass as first argument to .bat (so it doesn't rely on default)
+      const envPf = process.env["ProgramFiles"] || "C:\\Program Files";
+      const envPf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+      const envLocal = process.env["LocalAppData"] || "C:\\Users\\%USERNAME%\\AppData\\Local";
+      const candidates = [
+        path.join(envPf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        path.join(envPf86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        path.join(envLocal, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")
+      ];
+      let braveExe = candidates.find(p => {
+        try { return existsSync(p); } catch { return false; }
+      }) || "";
+      if (braveExe) { try { log("SYSTEM", "Profiles", `Detected Brave: ${braveExe}`); } catch(_) {} }
+
+      const args = [debug ? "/k" : "/c", "call", profilePath];
+      if (braveExe) args.push(braveExe);
+      const child = spawn(process.env.COMSPEC || "cmd.exe", args, {
+        windowsHide: !debug,
+        detached: !debug,
+        stdio: debug ? "inherit" : "ignore",
+        cwd: batDir
+      });
+      if (!debug) child.unref();
+    } catch (e) {
+      return res.status(500).json({ error: String(e && e.message || e) });
+    }
+
+    return res.status(200).json({ success: true, path: profilePath });
+  } catch (e) {
+    return res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// --- API: alliance join ---
+app.post("/user/:id/alliance/join", async (req, res) => {
+  const { id } = req.params;
+  const { uuid } = req.body || {};
+  if (!users[id] || activeBrowserUsers.has(id)) return res.sendStatus(409);
+  if (typeof uuid !== 'string' || !uuid.trim()) return res.status(400).json({ error: "uuid_required" });
+
+  activeBrowserUsers.add(id);
+  const wplacer = new WPlacer();
+  try {
+    await wplacer.login(users[id].cookies);
+    const url = `https://bplace.org/alliance/join/${encodeURIComponent(uuid.trim())}`;
+    const response = await wplacer.browser.fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "text/html,application/json,*/\*",
+        Referer: "https://bplace.org/"
+      },
+      redirect: "manual"
+    });
+    const status = response.status | 0;
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const text = await response.text();
+    if (status >= 200 && status < 400) {
+      res.status(200).json({ success: true });
+      log(id, users[id].name, `Alliance join OK (uuid=${uuid}, status=${status}, type=${contentType || 'n/a'})`);
+      console.log(`[Alliance] join success: user #${id} (${users[id].name}) -> uuid=${uuid} status=${status}`);
+    } else {
+      const short = String(text || '').slice(0, 200);
+      log(id, users[id].name, `Alliance join FAILED (uuid=${uuid}, status=${status}) payload: ${short}`);
+      console.error(`[Alliance] join failed: user #${id} (${users[id].name}) uuid=${uuid} status=${status} body: ${short}`);
+      res.status(status || 500).json({ error: "alliance_join_failed", status, body: short });
+    }
+  } catch (error) {
+    logUserError(error, id, users[id].name, "alliance join");
+    console.error(`[Alliance] join exception: user #${id} (${users[id].name}) uuid=${uuid}:`, error?.message || error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    activeBrowserUsers.delete(id);
+  }
+});
+
+// --- API: alliance leave ---
+app.post("/user/:id/alliance/leave", async (req, res) => {
+  const { id } = req.params;
+  if (!users[id] || activeBrowserUsers.has(id)) return res.sendStatus(409);
+
+  activeBrowserUsers.add(id);
+  const wplacer = new WPlacer();
+  try {
+    await wplacer.login(users[id].cookies);
+    const url = `https://bplace.org/alliance/leave`;
+    const response = await wplacer.browser.fetch(url, {
+      method: "POST",
+      headers: {
+        Accept: "*/*",
+        Referer: "https://bplace.org/"
+      }
+    });
+    const status = response.status | 0;
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const text = await response.text();
+    if (status >= 200 && status < 300) {
+      res.status(200).json({ success: true });
+      log(id, users[id].name, `Alliance leave OK (status=${status}, type=${contentType || 'n/a'})`);
+      console.log(`[Alliance] leave success: user #${id} (${users[id].name}) status=${status}`);
+    } else {
+      const short = String(text || '').slice(0, 200);
+      log(id, users[id].name, `Alliance leave FAILED (status=${status}) payload: ${short}`);
+      console.error(`[Alliance] leave failed: user #${id} (${users[id].name}) status=${status} body: ${short}`);
+      res.status(status || 500).json({ error: "alliance_leave_failed", status, body: short });
+    }
+  } catch (error) {
+    logUserError(error, id, users[id].name, "alliance leave");
+    console.error(`[Alliance] leave exception: user #${id} (${users[id].name}):`, error?.message || error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    activeBrowserUsers.delete(id);
+  }
+});
+
+app.post("/users/buy-max-upgrades", async (req, res) => {
+  if (buyMaxJob.active) return res.status(409).json({ error: "buy_max_in_progress" });
+  const report = [];
+  const cooldown = currentSettings.purchaseCooldown || 5000;
+  const dummyTemplate = { width: 0, height: 0, data: [] };
+  const dummyCoords = [0, 0, 0, 0];
+  const userIds = Object.keys(users);
+
+  buyMaxJob = { active: true, total: userIds.length, completed: 0, startedAt: Date.now(), finishedAt: 0, lastUserId: null, lastUserName: null };
+
+  const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+  if (useParallel) {
+    const ids = userIds.map(String);
+    const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+    const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+    console.log(`[BuyMax] Parallel mode: ${ids.length} users, concurrency=${concurrency}, proxies=${loadedProxies.length}`);
+    let index = 0;
+    const worker = async () => {
+      for (; ;) {
+        const i = index++;
+        if (i >= ids.length) break;
+        const userId = ids[i];
+        const urec = users[userId];
+        if (!urec) { report.push({ userId, name: `#${userId}`, skipped: true, reason: "unknown_user" }); buyMaxJob.completed++; continue; }
+        if (activeBrowserUsers.has(userId)) { report.push({ userId, name: urec.name, skipped: true, reason: "busy" }); buyMaxJob.completed++; continue; }
+
+        activeBrowserUsers.add(userId);
+        const wplacer = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "AdminPurchase");
+        try {
+          await wplacer.login(urec.cookies);
+          await wplacer.loadUserInfo();
+          buyMaxJob.lastUserId = userId; buyMaxJob.lastUserName = wplacer.userInfo.name;
+          const beforeDroplets = wplacer.userInfo.droplets;
+          const reserve = currentSettings.dropletReserve || 0;
+          const affordable = Math.max(0, beforeDroplets - reserve);
+          const amountToBuy = Math.floor(affordable / 500);
+          if (amountToBuy > 0) {
+            await wplacer.buyProduct(70, amountToBuy);
+            report.push({ userId, name: wplacer.userInfo.name, amount: amountToBuy, beforeDroplets, afterDroplets: beforeDroplets - amountToBuy * 500 });
+          } else {
+            report.push({ userId, name: wplacer.userInfo.name, amount: 0, skipped: true, reason: "insufficient_droplets_or_reserve" });
+          }
+        } catch (error) {
+          logUserError(error, userId, urec.name, "bulk buy max charge upgrades");
+          report.push({ userId, name: urec.name, error: error?.message || String(error) });
+        } finally {
+          activeBrowserUsers.delete(userId);
+          buyMaxJob.completed++;
+        }
+        const cd = Math.max(0, Number(currentSettings.purchaseCooldown || 0));
+        if (cd > 0) await sleep(cd);
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  } else {
+    for (let i = 0; i < userIds.length; i++) {
+      const userId = userIds[i];
+      const urec = users[userId];
+      if (!urec) continue;
+      if (activeBrowserUsers.has(userId)) { report.push({ userId, name: urec.name, skipped: true, reason: "busy" }); continue; }
+      activeBrowserUsers.add(userId);
+      const wplacer = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "AdminPurchase");
+      try {
+        await wplacer.login(urec.cookies); await wplacer.loadUserInfo();
+        buyMaxJob.lastUserId = userId; buyMaxJob.lastUserName = wplacer.userInfo.name;
+        const beforeDroplets = wplacer.userInfo.droplets;
+        const reserve = currentSettings.dropletReserve || 0;
+        const affordable = Math.max(0, beforeDroplets - reserve);
+        const amountToBuy = Math.floor(affordable / 500);
+        if (amountToBuy > 0) {
+          await wplacer.buyProduct(70, amountToBuy);
+          report.push({ userId, name: wplacer.userInfo.name, amount: amountToBuy, beforeDroplets, afterDroplets: beforeDroplets - amountToBuy * 500 });
+        } else {
+          report.push({ userId, name: wplacer.userInfo.name, amount: 0, skipped: true, reason: "insufficient_droplets_or_reserve" });
+        }
+      } catch (error) {
+        logUserError(error, userId, urec.name, "bulk buy max charge upgrades");
+        report.push({ userId, name: urec.name, error: error?.message || String(error) });
+      } finally {
+        activeBrowserUsers.delete(userId);
+        buyMaxJob.completed++;
+      }
+      if (i < userIds.length - 1 && cooldown > 0) { await sleep(cooldown); }
+    }
+  }
+
+  buyMaxJob.active = false; buyMaxJob.finishedAt = Date.now();
+  res.json({ ok: true, cooldownMs: cooldown, reserve: currentSettings.dropletReserve || 0, report });
+});
+
+// Bulk buy paint charges for all users (uses dropletReserve and purchaseCooldown)
+app.post("/users/buy-charges", async (req, res) => {
+  if (buyChargesJob.active) return res.status(409).json({ error: "buy_charges_in_progress" });
+  const report = [];
+  const cooldown = currentSettings.purchaseCooldown || 5000;
+  const dummyTemplate = { width: 0, height: 0, data: [] };
+  const dummyCoords = [0, 0, 0, 0];
+  const userIds = Object.keys(users);
+
+  buyChargesJob = { active: true, total: userIds.length, completed: 0, startedAt: Date.now(), finishedAt: 0, lastUserId: null, lastUserName: null };
+
+  const doOne = async (userId) => {
+    const urec = users[userId];
+    if (!urec) { report.push({ userId, name: `#${userId}`, skipped: true, reason: "unknown_user" }); buyChargesJob.completed++; return; }
+    if (activeBrowserUsers.has(userId)) { report.push({ userId, name: urec.name, skipped: true, reason: "busy" }); buyChargesJob.completed++; return; }
+
+    activeBrowserUsers.add(userId);
+    const wplacer = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "AdminPurchaseCharges");
+    try {
+      await wplacer.login(urec.cookies);
+      await wplacer.loadUserInfo();
+      buyChargesJob.lastUserId = userId; buyChargesJob.lastUserName = wplacer.userInfo.name;
+      const beforeDroplets = Number(wplacer.userInfo.droplets || 0);
+      const reserve = Number(currentSettings.dropletReserve || 0);
+      const affordable = Math.max(0, beforeDroplets - reserve);
+      const amountToBuy = Math.floor(affordable / 500);
+      if (amountToBuy > 0) {
+        await wplacer.buyProduct(80, amountToBuy);
+        report.push({ userId, name: wplacer.userInfo.name, amount: amountToBuy, beforeDroplets, afterDroplets: beforeDroplets - amountToBuy * 500 });
+      } else {
+        report.push({ userId, name: wplacer.userInfo.name, amount: 0, skipped: true, reason: "insufficient_droplets_or_reserve" });
+      }
+    } catch (error) {
+      logUserError(error, userId, urec.name, "bulk buy paint charges");
+      report.push({ userId, name: urec.name, error: error?.message || String(error) });
+    } finally {
+      activeBrowserUsers.delete(userId);
+      buyChargesJob.completed++;
+    }
+  };
+
+  try {
+    const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+    if (useParallel) {
+      const ids = userIds.map(String);
+      const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+      const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+      console.log(`[BuyCharges] Parallel mode: ${ids.length} users, concurrency=${concurrency}, proxies=${loadedProxies.length}`);
+      let index = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = index++;
+          if (i >= ids.length) break;
+          await doOne(ids[i]);
+          const cd = Math.max(0, Number(currentSettings.purchaseCooldown || 0));
+          if (cd > 0) await sleep(cd);
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } else {
+      for (let i = 0; i < userIds.length; i++) {
+        await doOne(userIds[i]);
+        if (i < userIds.length - 1 && cooldown > 0) { await sleep(cooldown); }
+      }
+    }
+    buyChargesJob.active = false; buyChargesJob.finishedAt = Date.now();
+    res.json({ ok: true, cooldownMs: cooldown, reserve: currentSettings.dropletReserve || 0, report });
+  } catch (e) {
+    buyChargesJob.active = false; buyChargesJob.finishedAt = Date.now();
+    console.error("buy-charges failed:", e);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+app.post("/users/purchase-color", async (req, res) => {
+  try {
+    const { colorId, userIds } = req.body || {};
+    const cid = Number(colorId);
+    if (!Number.isFinite(cid) || cid < 32 || cid > 63) {
+      return res.status(400).json({ error: "colorId must be a premium color id (32..63)" });
+    }
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: "userIds must be a non-empty array" });
+    }
+
+    const cooldown = currentSettings.purchaseCooldown || 5000;
+    const reserve = currentSettings.dropletReserve || 0;
+
+    const dummyTemplate = { width: 0, height: 0, data: [] };
+    const dummyCoords = [0, 0, 0, 0];
+
+    const report = [];
+
+    if (purchaseColorJob.active) {
+      return res.status(409).json({ error: "purchase_in_progress" });
+    }
+    purchaseColorJob = { active: true, total: userIds.length, completed: 0, startedAt: Date.now(), finishedAt: 0, lastUserId: null, lastUserName: null };
+
+    const hasColor = (bitmap, colorId) => {
+      const bit = colorId - 32;
+      return (bitmap & (1 << bit)) !== 0;
+    };
+
+    const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+    if (useParallel) {
+      const ids = userIds.map(String);
+      const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+      const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+      console.log(`[ColorPurchase] Parallel mode: ${ids.length} users, concurrency=${concurrency}, proxies=${loadedProxies.length}`);
+      let index = 0;
+      const worker = async () => {
+        for (; ;) {
+          const i = index++;
+          if (i >= ids.length) break;
+          const uid = ids[i];
+          const urec = users[uid];
+          if (!urec) { report.push({ userId: uid, name: `#${uid}`, skipped: true, reason: "unknown_user" }); continue; }
+          if (activeBrowserUsers.has(uid)) { report.push({ userId: uid, name: urec.name, skipped: true, reason: "busy" }); continue; }
+          activeBrowserUsers.add(uid);
+          const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "ColorPurchase");
+          try {
+            await w.login(urec.cookies);
+            await w.loadUserInfo();
+            const name = w.userInfo.name;
+            purchaseColorJob.lastUserId = uid; purchaseColorJob.lastUserName = name;
+            const beforeBitmap = Number(w.userInfo.extraColorsBitmap || 0);
+            const beforeDroplets = Number(w.userInfo.droplets || 0);
+            if (hasColor(beforeBitmap, cid)) {
+              report.push({ userId: uid, name, skipped: true, reason: "already_has_color" });
+            } else {
+              try {
+                await w.buyProduct(100, 1, cid);
+                await w.loadUserInfo().catch(() => { });
+                report.push({ userId: uid, name, ok: true, success: true, beforeDroplets, afterDroplets: w.userInfo?.droplets });
+              } catch (err) {
+                if (err?.code === 403 || /FORBIDDEN_OR_INSUFFICIENT/i.test(err?.message)) {
+                  report.push({ userId: uid, name, skipped: true, reason: "forbidden_or_insufficient_droplets" });
+                } else if (/(1015)/.test(err?.message)) {
+                  report.push({ userId: uid, name, error: "rate_limited" });
+                } else {
+                  report.push({ userId: uid, name, error: err?.message || "purchase_failed" });
+                }
+              }
+            }
+          } catch (e) {
+            logUserError(e, uid, urec.name, "purchase color");
+            report.push({ userId: uid, name: urec.name, error: e?.message || "login_failed" });
+          } finally {
+            activeBrowserUsers.delete(uid);
+            purchaseColorJob.completed++;
+          }
+          const cd = Math.max(0, Number(currentSettings.purchaseCooldown || 0));
+          if (cd > 0) await sleep(cd);
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } else {
+      for (let idx = 0; idx < userIds.length; idx++) {
+        const uid = String(userIds[idx]);
+        const urec = users[uid];
+        if (!urec) { report.push({ userId: uid, name: `#${uid}`, skipped: true, reason: "unknown_user" }); continue; }
+        if (activeBrowserUsers.has(uid)) { report.push({ userId: uid, name: urec.name, skipped: true, reason: "busy" }); continue; }
+        activeBrowserUsers.add(uid);
+        const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "ColorPurchase");
+        try {
+          await w.login(urec.cookies);
+          await w.loadUserInfo();
+          const name = w.userInfo.name;
+          purchaseColorJob.lastUserId = uid; purchaseColorJob.lastUserName = name;
+          const beforeBitmap = Number(w.userInfo.extraColorsBitmap || 0);
+          const beforeDroplets = Number(w.userInfo.droplets || 0);
+          if (hasColor(beforeBitmap, cid)) {
+            report.push({ userId: uid, name, skipped: true, reason: "already_has_color" });
+          } else {
+            try {
+              await w.buyProduct(100, 1, cid);
+              await sleep(cooldown);
+              await w.loadUserInfo().catch(() => { });
+              report.push({ userId: uid, name, ok: true, success: true, beforeDroplets, afterDroplets: w.userInfo?.droplets });
+            } catch (err) {
+              if (err?.code === 403 || /FORBIDDEN_OR_INSUFFICIENT/i.test(err?.message)) {
+                report.push({ userId: uid, name, skipped: true, reason: "forbidden_or_insufficient_droplets" });
+              } else if (/(1015)/.test(err?.message)) {
+                report.push({ userId: uid, name, error: "rate_limited" });
+              } else {
+                report.push({ userId: uid, name, error: err?.message || "purchase_failed" });
+              }
+            }
+          }
+        } catch (e) {
+          logUserError(e, uid, urec.name, "purchase color");
+          report.push({ userId: uid, name: urec.name, error: e?.message || "login_failed" });
+        } finally {
+          activeBrowserUsers.delete(uid);
+          purchaseColorJob.completed++;
+        }
+        if (idx < userIds.length - 1 && cooldown > 0) { await sleep(cooldown); }
+      }
+    }
+
+    purchaseColorJob.active = false; purchaseColorJob.finishedAt = Date.now();
+    res.json({ colorId: cid, cooldownMs: cooldown, reserve, report });
+  } catch (e) {
+    purchaseColorJob.active = false; purchaseColorJob.finishedAt = Date.now();
+    console.error("purchase-color failed:", e);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// --- API: users flags check (parallel with proxies, else sequential) ---
+app.post("/users/flags-check", async (req, res) => {
+  try {
+    if (flagsCheckJob.active) {
+      return res.status(409).json({ error: "flags_check_in_progress" });
+    }
+
+    const cooldown = currentSettings.accountCheckCooldown || 0;
+
+    const dummyTemplate = { width: 0, height: 0, data: [] };
+    const dummyCoords = [0, 0, 0, 0];
+
+    const ids = Object.keys(users);
+    flagsCheckJob = {
+      active: true,
+      total: ids.length,
+      completed: 0,
+      startedAt: Date.now(),
+      finishedAt: 0,
+      lastUserId: null,
+      lastUserName: null,
+      report: []
+    };
+
+    const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+    const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+    const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+    if (useParallel) {
+      console.log(`[FlagsCheck] Parallel: ${ids.length} accounts (concurrency=${concurrency}, proxies=${loadedProxies.length})`);
+    } else {
+      console.log(`[FlagsCheck] Sequential: ${ids.length} accounts. Cooldown=${cooldown}ms`);
+    }
+
+    const workerIds = ids.map(String);
+
+    const doOne = async (uid) => {
+      if (!users[uid]) return;
+      if (activeBrowserUsers.has(uid)) return;
+      activeBrowserUsers.add(uid);
+      const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "FlagsCheck");
+      try {
+        await w.login(users[uid].cookies);
+        await w.loadUserInfo();
+        const u = w.userInfo || {};
+        flagsCheckJob.lastUserId = uid; flagsCheckJob.lastUserName = u.name;
+        flagsCheckJob.report.push({
+          userId: String(uid),
+          name: u.name,
+          flagsBitmap: u.flagsBitmap || "",
+          equippedFlag: Number(u.equippedFlag || 0),
+          droplets: Number(u.droplets || 0)
+        });
+      } catch (e) {
+        logUserError(e, uid, users[uid]?.name || `#${uid}`, "flags check");
+        flagsCheckJob.report.push({ userId: String(uid), name: users[uid]?.name || `#${uid}`, error: e?.message || "failed" });
+      } finally {
+        activeBrowserUsers.delete(uid);
+        flagsCheckJob.completed++;
+      }
+      if (cooldown > 0) await sleep(cooldown);
+    };
+
+    if (useParallel) {
+      let index = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = index++; if (i >= workerIds.length) break;
+          await doOne(workerIds[i]);
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } else {
+      for (let i = 0; i < workerIds.length; i++) {
+        await doOne(workerIds[i]);
+      }
+    }
+
+    flagsCheckJob.active = false; flagsCheckJob.finishedAt = Date.now();
+    const tookMs = (flagsCheckJob.finishedAt - (flagsCheckJob.startedAt || flagsCheckJob.finishedAt));
+    const tookS = Math.max(1, Math.round(tookMs / 1000));
+    console.log(`[FlagsCheck] Finished: ${flagsCheckJob.completed}/${flagsCheckJob.total} in ${tookS}s.`);
+    res.json({ ok: true, ts: flagsCheckJob.finishedAt || Date.now(), cooldownMs: cooldown, report: flagsCheckJob.report });
+  } catch (e) {
+    flagsCheckJob.active = false; flagsCheckJob.finishedAt = Date.now();
+    console.error("flags-check failed:", e);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// progress endpoint for flags-check
+app.get("/users/flags-check/progress", (req, res) => {
+  const { active, total, completed, startedAt, finishedAt, lastUserId, lastUserName } = flagsCheckJob;
+  res.json({ active, total, completed, startedAt, finishedAt, lastUserId, lastUserName });
+});
+
+// --- API: users purchase flag ---
+app.post("/users/purchase-flag", async (req, res) => {
+  try {
+    const { flagId, userIds } = req.body || {};
+    const fid = Number(flagId);
+    if (!Number.isFinite(fid) || fid < 1 || fid > 10000) {
+      return res.status(400).json({ error: "flagId must be a valid flag id" });
+    }
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: "userIds must be a non-empty array" });
+    }
+
+    const cooldown = currentSettings.purchaseCooldown || 5000;
+    const reserve = currentSettings.dropletReserve || 0;
+    const FLAG_COST = 20000;
+
+    const dummyTemplate = { width: 0, height: 0, data: [] };
+    const dummyCoords = [0, 0, 0, 0];
+
+    const report = [];
+
+    if (purchaseFlagJob.active) {
+      return res.status(409).json({ error: "purchase_in_progress" });
+    }
+    purchaseFlagJob = { active: true, total: userIds.length, completed: 0, startedAt: Date.now(), finishedAt: 0, lastUserId: null, lastUserName: null };
+
+    const decodeFlags = (b64) => {
+      if (!b64 || typeof b64 !== 'string') return [];
+      try {
+        const bytes = Uint8Array.from(Buffer.from(b64, 'base64'));
+        const L = bytes.length; const ids = [];
+        for (let i = 0; i < L; i++) {
+          const v = bytes[i]; if (v === 0) continue;
+          for (let bit = 0; bit < 8; bit++) if (v & (1 << bit)) ids.push((L - 1 - i) * 8 + bit);
+        }
+        return ids.sort((a, b) => a - b);
+      } catch (_) { return []; }
+    };
+
+    const doOne = async (uid) => {
+      if (!users[uid]) { report.push({ userId: uid, error: 'not_found' }); purchaseFlagJob.completed++; return; }
+      if (activeBrowserUsers.has(uid)) { report.push({ userId: uid, error: 'busy' }); purchaseFlagJob.completed++; return; }
+      activeBrowserUsers.add(uid);
+      const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "FlagPurchase");
+      try {
+        await w.login(users[uid].cookies);
+        await w.loadUserInfo();
+        const name = w.userInfo?.name;
+        purchaseFlagJob.lastUserId = uid; purchaseFlagJob.lastUserName = name;
+        const beforeDroplets = Number(w.userInfo?.droplets || 0);
+        const owned = new Set(decodeFlags(String(w.userInfo?.flagsBitmap || '')));
+        if (owned.has(fid)) {
+          report.push({ userId: uid, name, skipped: true, reason: 'already_has_flag' });
+        } else if (beforeDroplets < FLAG_COST) {
+          report.push({ userId: uid, name, skipped: true, reason: 'forbidden_or_insufficient_droplets' });
+        } else {
+          try {
+            // product id 110 per user: flags, variant = flagId
+            await w.buyProduct(110, 1, fid);
+            await w.loadUserInfo().catch(() => { });
+            report.push({ userId: uid, name, ok: true, success: true, beforeDroplets, afterDroplets: w.userInfo?.droplets });
+          } catch (err) {
+            if (err?.code === 403 || /FORBIDDEN_OR_INSUFFICIENT/i.test(err?.message)) {
+              report.push({ userId: uid, name, skipped: true, reason: "forbidden_or_insufficient_droplets" });
+            } else if (/(1015)/.test(err?.message)) {
+              report.push({ userId: uid, name, error: "rate_limited" });
+            } else {
+              report.push({ userId: uid, name, error: err?.message || "purchase_failed" });
+            }
+          }
+        }
+      } catch (e) {
+        logUserError(e, uid, users[uid]?.name || `#${uid}`, "purchase flag");
+        report.push({ userId: uid, name: users[uid]?.name || `#${uid}`, error: e?.message || 'login_failed' });
+      } finally {
+        activeBrowserUsers.delete(uid);
+        purchaseFlagJob.completed++;
+      }
+    };
+
+    const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+    if (useParallel) {
+      const ids = userIds.map(String);
+      const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+      const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+      console.log(`[FlagPurchase] Parallel mode: ${ids.length} users, concurrency=${concurrency}, proxies=${loadedProxies.length}`);
+      let index = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = index++;
+          if (i >= ids.length) break;
+          await doOne(ids[i]);
+          const cd = Math.max(0, Number(currentSettings.purchaseCooldown || 0));
+          if (cd > 0) await sleep(cd);
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } else {
+      console.log(`[FlagPurchase] Sequential: ${userIds.length} accounts. Cooldown=${cooldown}ms`);
+      for (let idx = 0; idx < userIds.length; idx++) {
+        await doOne(String(userIds[idx]));
+        if (idx < userIds.length - 1 && cooldown > 0) { await sleep(cooldown); }
+      }
+    }
+
+    purchaseFlagJob.active = false; purchaseFlagJob.finishedAt = Date.now();
+    const tookMs = (purchaseFlagJob.finishedAt - (purchaseFlagJob.startedAt || purchaseFlagJob.finishedAt));
+    const tookS = Math.max(1, Math.round(tookMs / 1000));
+    console.log(`[FlagPurchase] Finished: ${purchaseFlagJob.completed}/${purchaseFlagJob.total} in ${tookS}s.`);
+    res.json({ flagId: fid, cooldownMs: cooldown, reserve, report });
+  } catch (e) {
+    purchaseFlagJob.active = false; purchaseFlagJob.finishedAt = Date.now();
+    console.error("purchase-flag failed:", e);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// progress endpoint for purchase-flag
+app.get("/users/purchase-flag/progress", (req, res) => {
+  const { active, total, completed, startedAt, finishedAt, lastUserId, lastUserName } = purchaseFlagJob;
+  res.json({ active, total, completed, startedAt, finishedAt, lastUserId, lastUserName });
+});
+
+// --- API: equip/unequip flag for specific user ---
+app.post("/user/:id/flag/equip", async (req, res) => {
+  const uid = String(req.params.id);
+  const fid = Number(req.body?.flagId || 0) || 0;
+  if (!users[uid]) return res.sendStatus(404);
+  if (activeBrowserUsers.has(uid)) return res.sendStatus(409);
+  activeBrowserUsers.add(uid);
+  const dummyTemplate = { width: 0, height: 0, data: [] };
+  const dummyCoords = [0, 0, 0, 0];
+  const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "FlagEquip");
+  try {
+    await w.login(users[uid].cookies); await w.loadUserInfo();
+    await w.equipFlag(fid);
+    await w.loadUserInfo().catch(() => {});
+    res.json({ success: true, equippedFlag: Number(w.userInfo?.equippedFlag || fid) });
+  } catch (e) {
+    logUserError(e, uid, users[uid]?.name || `#${uid}`, "equip flag");
+    if (e?.code === 403) return res.status(403).json({ error: 'forbidden' });
+    res.status(500).json({ error: e?.message || 'failed' });
+  } finally {
+    activeBrowserUsers.delete(uid);
+  }
+});
+
+// --- API: users batch equip flag ---
+let equipFlagJob = { active: false, total: 0, completed: 0, startedAt: 0, finishedAt: 0, lastUserId: null, lastUserName: null };
+app.post("/users/equip-flag", async (req, res) => {
+  try {
+    const { flagId, userIds } = req.body || {};
+    const fid = Number(flagId) || 0;
+    if (!Array.isArray(userIds) || userIds.length === 0) return res.status(400).json({ error: "userIds must be a non-empty array" });
+    if (equipFlagJob.active) return res.status(409).json({ error: "equip_in_progress" });
+    equipFlagJob = { active: true, total: userIds.length, completed: 0, startedAt: Date.now(), finishedAt: 0, lastUserId: null, lastUserName: null };
+
+    const dummyTemplate = { width: 0, height: 0, data: [] };
+    const dummyCoords = [0, 0, 0, 0];
+    const report = [];
+    const cooldown = currentSettings.purchaseCooldown || 0;
+
+    const doOne = async (uid) => {
+      if (!users[uid]) { report.push({ userId: uid, error: 'not_found' }); equipFlagJob.completed++; return; }
+      if (activeBrowserUsers.has(uid)) { report.push({ userId: uid, error: 'busy' }); equipFlagJob.completed++; return; }
+      activeBrowserUsers.add(uid);
+      const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "FlagEquipBatch");
+      try {
+        await w.login(users[uid].cookies); await w.loadUserInfo();
+        equipFlagJob.lastUserId = uid; equipFlagJob.lastUserName = w.userInfo?.name;
+        await w.equipFlag(fid);
+        await w.loadUserInfo().catch(() => {});
+        report.push({ userId: uid, name: w.userInfo?.name, ok: true, success: true, equippedFlag: Number(w.userInfo?.equippedFlag || fid) });
+      } catch (e) {
+        logUserError(e, uid, users[uid]?.name || `#${uid}`, "equip flag batch");
+        report.push({ userId: uid, name: users[uid]?.name || `#${uid}`, error: e?.message || 'failed' });
+      } finally {
+        activeBrowserUsers.delete(uid);
+        equipFlagJob.completed++;
+      }
+    };
+
+    const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+    if (useParallel) {
+      const ids = userIds.map(String);
+      const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+      const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+      console.log(`[FlagEquip] Parallel mode: ${ids.length} users, concurrency=${concurrency}, proxies=${loadedProxies.length}`);
+      let index = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = index++;
+          if (i >= ids.length) break;
+          await doOne(ids[i]);
+          const cd = Math.max(0, Number(currentSettings.purchaseCooldown || 0));
+          if (cd > 0) await sleep(cd);
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } else {
+      for (let i = 0; i < userIds.length; i++) {
+        await doOne(String(userIds[i]));
+        if (i < userIds.length - 1 && cooldown > 0) await sleep(cooldown);
+      }
+    }
+
+    equipFlagJob.active = false; equipFlagJob.finishedAt = Date.now();
+    res.json({ flagId: fid, cooldownMs: cooldown, report });
+  } catch (e) {
+    equipFlagJob.active = false; equipFlagJob.finishedAt = Date.now();
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+app.get("/users/equip-flag/progress", (req, res) => {
+  const { active, total, completed, startedAt, finishedAt, lastUserId, lastUserName } = equipFlagJob;
+  res.json({ active, total, completed, startedAt, finishedAt, lastUserId, lastUserName });
+});
+
+// --- API: users batch unequip flag (flagId=0) ---
+let unequipFlagJob = { active: false, total: 0, completed: 0, startedAt: 0, finishedAt: 0, lastUserId: null, lastUserName: null };
+app.post("/users/unequip-flag", async (req, res) => {
+  try {
+    const { userIds } = req.body || {};
+    if (!Array.isArray(userIds) || userIds.length === 0) return res.status(400).json({ error: "userIds must be a non-empty array" });
+    if (unequipFlagJob.active) return res.status(409).json({ error: "unequip_in_progress" });
+    unequipFlagJob = { active: true, total: userIds.length, completed: 0, startedAt: Date.now(), finishedAt: 0, lastUserId: null, lastUserName: null };
+
+    const dummyTemplate = { width: 0, height: 0, data: [] };
+    const dummyCoords = [0, 0, 0, 0];
+    const report = [];
+    const cooldown = currentSettings.purchaseCooldown || 0;
+
+    const doOne = async (uid) => {
+      if (!users[uid]) { report.push({ userId: uid, error: 'not_found' }); unequipFlagJob.completed++; return; }
+      if (activeBrowserUsers.has(uid)) { report.push({ userId: uid, error: 'busy' }); unequipFlagJob.completed++; return; }
+      activeBrowserUsers.add(uid);
+      const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "FlagUnequipBatch");
+      try {
+        await w.login(users[uid].cookies); await w.loadUserInfo();
+        unequipFlagJob.lastUserId = uid; unequipFlagJob.lastUserName = w.userInfo?.name;
+        await w.equipFlag(0);
+        await w.loadUserInfo().catch(() => {});
+        report.push({ userId: uid, name: w.userInfo?.name, ok: true, success: true, equippedFlag: Number(w.userInfo?.equippedFlag || 0) });
+      } catch (e) {
+        logUserError(e, uid, users[uid]?.name || `#${uid}`, "unequip flag batch");
+        report.push({ userId: uid, name: users[uid]?.name || `#${uid}`, error: e?.message || 'failed' });
+      } finally {
+        activeBrowserUsers.delete(uid);
+        unequipFlagJob.completed++;
+      }
+    };
+
+    const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+    if (useParallel) {
+      const ids = userIds.map(String);
+      const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+      const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+      console.log(`[FlagUnequip] Parallel mode: ${ids.length} users, concurrency=${concurrency}, proxies=${loadedProxies.length}`);
+      let index = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = index++;
+          if (i >= ids.length) break;
+          await doOne(ids[i]);
+          const cd = Math.max(0, Number(currentSettings.purchaseCooldown || 0));
+          if (cd > 0) await sleep(cd);
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } else {
+      for (let i = 0; i < userIds.length; i++) {
+        await doOne(String(userIds[i]));
+        if (i < userIds.length - 1 && cooldown > 0) await sleep(cooldown);
+      }
+    }
+
+    unequipFlagJob.active = false; unequipFlagJob.finishedAt = Date.now();
+    res.json({ cooldownMs: cooldown, report });
+  } catch (e) {
+    unequipFlagJob.active = false; unequipFlagJob.finishedAt = Date.now();
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+app.get("/users/unequip-flag/progress", (req, res) => {
+  const { active, total, completed, startedAt, finishedAt, lastUserId, lastUserName } = unequipFlagJob;
+  res.json({ active, total, completed, startedAt, finishedAt, lastUserId, lastUserName });
+});
+// --- API: users colors check (parallel with proxies, else sequential) ---
+app.post("/users/colors-check", async (req, res) => {
+  try {
+    if (colorsCheckJob.active) {
+      return res.status(409).json({ error: "colors_check_in_progress" });
+    }
+
+    const cooldown = currentSettings.accountCheckCooldown || 0;
+
+    const dummyTemplate = { width: 0, height: 0, data: [] };
+    const dummyCoords = [0, 0, 0, 0];
+
+    const ids = Object.keys(users);
+    colorsCheckJob = {
+      active: true,
+      total: ids.length,
+      completed: 0,
+      startedAt: Date.now(),
+      finishedAt: 0,
+      lastUserId: null,
+      lastUserName: null,
+      report: []
+    };
+
+    const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+    if (useParallel) {
+      const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+      const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+      console.log(`[ColorsCheck] Parallel: ${ids.length} accounts (concurrency=${concurrency}, proxies=${loadedProxies.length})`);
+      let index = 0;
+      const worker = async () => {
+        for (; ;) {
+          const i = index++;
+          if (i >= ids.length) break;
+          const uid = String(ids[i]);
+          const urec = users[uid];
+          if (!urec) { continue; }
+
+          colorsCheckJob.lastUserId = uid;
+          colorsCheckJob.lastUserName = urec?.name || `#${uid}`;
+
+          if (activeBrowserUsers.has(uid)) {
+            colorsCheckJob.report.push({ userId: uid, name: urec.name, skipped: true, reason: "busy" });
+            colorsCheckJob.completed++;
+            continue;
+          }
+
+          activeBrowserUsers.add(uid);
+          const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "ColorsCheck");
+          try {
+            await w.login(urec.cookies);
+            await w.loadUserInfo();
+            const u = w.userInfo || {};
+            const charges = { count: Math.floor(Number(u?.charges?.count || 0)), max: Number(u?.charges?.max || 0) };
+            const levelNum = Number(u?.level || 0);
+            const level = Math.floor(levelNum);
+            const progress = Math.round((levelNum % 1) * 100);
+            colorsCheckJob.report.push({ userId: uid, name: u?.name || urec.name, extraColorsBitmap: Number(u?.extraColorsBitmap || 0), droplets: Number(u?.droplets || 0), charges, level, progress, flagsBitmap: String(u?.flagsBitmap || ""), equippedFlag: Number(u?.equippedFlag || 0) });
+          } catch (e) {
+            logUserError(e, uid, urec.name, "colors check");
+            colorsCheckJob.report.push({ userId: uid, name: urec.name, error: e?.message || "login_failed" });
+          } finally {
+            activeBrowserUsers.delete(uid);
+            colorsCheckJob.completed++;
+          }
+          const cd = Math.max(0, Number(currentSettings.accountCheckCooldown || 0));
+          if (cd > 0) await sleep(cd);
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } else {
+      console.log(`[ColorsCheck] Sequential: ${ids.length} accounts. Cooldown=${cooldown}ms`);
+      for (let i = 0; i < ids.length; i++) {
+        const uid = String(ids[i]);
+        const urec = users[uid];
+        if (!urec) { continue; }
+
+        colorsCheckJob.lastUserId = uid;
+        colorsCheckJob.lastUserName = urec?.name || `#${uid}`;
+
+        if (activeBrowserUsers.has(uid)) {
+          colorsCheckJob.report.push({ userId: uid, name: urec.name, skipped: true, reason: "busy" });
+          colorsCheckJob.completed++;
+          continue;
+        }
+
+        activeBrowserUsers.add(uid);
+        const w = new WPlacer(dummyTemplate, dummyCoords, currentSettings, "ColorsCheck");
+        try {
+          await w.login(urec.cookies);
+          await w.loadUserInfo();
+          const u = w.userInfo || {};
+          const charges = { count: Math.floor(Number(u?.charges?.count || 0)), max: Number(u?.charges?.max || 0) };
+          const levelNum = Number(u?.level || 0);
+          const level = Math.floor(levelNum);
+          const progress = Math.round((levelNum % 1) * 100);
+          colorsCheckJob.report.push({ userId: uid, name: u?.name || urec.name, extraColorsBitmap: Number(u?.extraColorsBitmap || 0), droplets: Number(u?.droplets || 0), charges, level, progress, flagsBitmap: String(u?.flagsBitmap || ""), equippedFlag: Number(u?.equippedFlag || 0) });
+        } catch (e) {
+          logUserError(e, uid, urec.name, "colors check");
+          colorsCheckJob.report.push({ userId: uid, name: urec.name, error: e?.message || "login_failed" });
+        } finally {
+          activeBrowserUsers.delete(uid);
+          colorsCheckJob.completed++;
+        }
+
+        if (i < ids.length - 1 && cooldown > 0) {
+          await sleep(cooldown);
+        }
+      }
+    }
+
+    colorsCheckJob.active = false;
+    colorsCheckJob.finishedAt = Date.now();
+    console.log(`[ColorsCheck] Finished: ${colorsCheckJob.completed}/${colorsCheckJob.total} in ${duration(colorsCheckJob.finishedAt - colorsCheckJob.startedAt)}.`);
+
+    res.json({ ok: true, ts: colorsCheckJob.finishedAt || Date.now(), cooldownMs: cooldown, report: colorsCheckJob.report });
+  } catch (e) {
+    colorsCheckJob.active = false;
+    colorsCheckJob.finishedAt = Date.now();
+    console.error("colors-check failed:", e);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// progress endpoint for colors-check
+app.get("/users/colors-check/progress", (req, res) => {
+  const { active, total, completed, startedAt, finishedAt, lastUserId, lastUserName } = colorsCheckJob;
+  res.json({ active, total, completed, startedAt, finishedAt, lastUserId, lastUserName });
+});
+
+// progress endpoint for purchase-color
+app.get("/users/purchase-color/progress", (req, res) => {
+  const { active, total, completed, startedAt, finishedAt, lastUserId, lastUserName } = purchaseColorJob;
+  res.json({ active, total, completed, startedAt, finishedAt, lastUserId, lastUserName });
+});
+
+// progress endpoint for buy-max-upgrades
+app.get("/users/buy-max-upgrades/progress", (req, res) => {
+  const { active, total, completed, startedAt, finishedAt, lastUserId, lastUserName } = buyMaxJob;
+  res.json({ active, total, completed, startedAt, finishedAt, lastUserId, lastUserName });
+});
+
+// progress endpoint for buy-charges
+app.get("/users/buy-charges/progress", (req, res) => {
+  const { active, total, completed, startedAt, finishedAt, lastUserId, lastUserName } = buyChargesJob;
+  res.json({ active, total, completed, startedAt, finishedAt, lastUserId, lastUserName });
+});
+
+// --- API: templates ---
+app.get("/templates", (_, res) => {
+  const sanitized = {};
+  for (const id in templates) {
+    const t = templates[id];
+    sanitized[id] = {
+      name: t.name,
+      template: t.template,
+      coords: t.coords,
+      canBuyCharges: t.canBuyCharges,
+      canBuyMaxCharges: t.canBuyMaxCharges,
+      autoBuyNeededColors: !!t.autoBuyNeededColors,
+      antiGriefMode: t.antiGriefMode,
+
+      skipPaintedPixels: t.skipPaintedPixels,
+      outlineMode: t.outlineMode,
+      paintTransparentPixels: t.paintTransparentPixels,
+      userIds: t.userIds,
+      running: t.running,
+      status: t.status,
+      pixelsRemaining: t.pixelsRemaining,
+      totalPixels: t.totalPixels,
+      heatmapEnabled: !!t.heatmapEnabled,
+      heatmapLimit: Math.max(0, Math.floor(Number(t.heatmapLimit || 10000))),
+      autoStart: !!t.autoStart
+    };
+  }
+  res.json(sanitized);
+});
+
+app.get("/template/:id", (req, res) => {
+  const { id } = req.params;
+  const t = templates[id];
+  if (!t) return res.sendStatus(404);
+  const sanitized = {
+    name: t.name,
+    template: t.template,
+    coords: t.coords,
+    canBuyCharges: t.canBuyCharges,
+    canBuyMaxCharges: t.canBuyMaxCharges,
+    autoBuyNeededColors: !!t.autoBuyNeededColors,
+    antiGriefMode: t.antiGriefMode,
+
+    skipPaintedPixels: t.skipPaintedPixels,
+    outlineMode: t.outlineMode,
+    paintTransparentPixels: t.paintTransparentPixels,
+    userIds: t.userIds,
+    running: t.running,
+    status: t.status,
+    pixelsRemaining: t.pixelsRemaining,
+    totalPixels: t.totalPixels,
+    heatmapEnabled: !!t.heatmapEnabled,
+    heatmapLimit: Math.max(0, Math.floor(Number(t.heatmapLimit || 10000))),
+    autoStart: !!t.autoStart
+  };
+  res.json(sanitized);
+});
+
+app.post("/template", async (req, res) => {
+  const { templateName, template, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, paintTransparentPixels, skipPaintedPixels, outlineMode, heatmapEnabled, heatmapLimit, autoStart } = req.body;
+  if (!templateName || !template || !coords || !userIds || !userIds.length) return res.sendStatus(400);
+  if (Object.values(templates).some((t) => t.name === templateName)) {
+    return res.status(409).json({ error: "A template with this name already exists." });
+  }
+  const templateId = Date.now().toString();
+  templates[templateId] = new TemplateManager(
+    templateName,
+    template,
+    coords,
+    canBuyCharges,
+    canBuyMaxCharges,
+    antiGriefMode,
+    userIds,
+    !!paintTransparentPixels,
+    skipPaintedPixels,
+    outlineMode
+  );
+  if (typeof req.body.autoBuyNeededColors !== 'undefined') {
+    templates[templateId].autoBuyNeededColors = !!req.body.autoBuyNeededColors;
+    if (templates[templateId].autoBuyNeededColors) {
+      templates[templateId].canBuyCharges = false;
+      templates[templateId].canBuyMaxCharges = false;
+    }
+  }
+  // Heatmap settings
+  try {
+    templates[templateId].heatmapEnabled = !!heatmapEnabled;
+    const lim = Math.max(0, Math.floor(Number(heatmapLimit)));
+    templates[templateId].heatmapLimit = lim > 0 ? lim : 10000;
+  } catch (_) { templates[templateId].heatmapEnabled = false; templates[templateId].heatmapLimit = 10000; }
+  
+  // Auto-start setting
+  templates[templateId].autoStart = !!autoStart;
+  
+  saveTemplates();
+  res.status(200).json({ id: templateId });
+});
+
+app.delete("/template/:id", async (req, res) => {
+  const { id } = req.params;
+  if (!id || !templates[id] || templates[id].running) return res.sendStatus(400);
+  delete templates[id];
+  saveTemplates();
+  res.sendStatus(200);
+});
+
+app.put("/template/edit/:id", async (req, res) => {
+  const { id } = req.params;
+  if (!templates[id]) return res.sendStatus(404);
+  const manager = templates[id];
+
+  const { templateName, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, template, paintTransparentPixels, skipPaintedPixels, outlineMode, heatmapEnabled, heatmapLimit, autoStart } = req.body;
+
+  const prevCoords = manager.coords;
+  const prevTemplateStr = JSON.stringify(manager.template);
+
+  manager.name = templateName;
+  // update coords only if provided as valid array of 4 numbers
+  let coordsChanged = false;
+  if (Array.isArray(coords) && coords.length === 4) {
+    const newCoords = coords.map((n) => Number(n));
+    coordsChanged = JSON.stringify(prevCoords) !== JSON.stringify(newCoords);
+    manager.coords = newCoords;
+  }
+  manager.userIds = userIds;
+  manager.canBuyCharges = canBuyCharges;
+  manager.canBuyMaxCharges = canBuyMaxCharges;
+  manager.antiGriefMode = antiGriefMode;
+  manager.skipPaintedPixels = skipPaintedPixels;
+  manager.outlineMode = outlineMode;
+  if (typeof req.body.autoBuyNeededColors !== 'undefined') {
+    manager.autoBuyNeededColors = !!req.body.autoBuyNeededColors;
+    if (manager.autoBuyNeededColors) {
+      manager.canBuyCharges = false;
+      manager.canBuyMaxCharges = false;
+    }
+  }
+
+  if (typeof paintTransparentPixels !== "undefined") {
+    manager.paintTransparentPixels = !!paintTransparentPixels;
+  }
+  // Heatmap settings
+  try {
+    manager.heatmapEnabled = !!heatmapEnabled;
+    const lim = Math.max(0, Math.floor(Number(heatmapLimit)));
+    manager.heatmapLimit = lim > 0 ? lim : 10000;
+  } catch (_) { }
+  
+  // Auto-start setting
+  if (typeof autoStart !== 'undefined') {
+    manager.autoStart = !!autoStart;
+  }
+
+  let templateChanged = false;
+  if (template) {
+    templateChanged = JSON.stringify(template) !== prevTemplateStr;
+    manager.template = template;
+  }
+
+  manager.masterId = manager.userIds[0];
+  manager.masterName = users[manager.masterId]?.name || "Unknown";
+
+  // reset seeds + clear heatmap if image or coords actually changed
+  if (templateChanged || coordsChanged) {
+    manager.burstSeeds = null;
+    // Also clear heatmap history if coordinates changed
+    try {
+      const filePath = path.join(heatMapsDir, `${id}.jsonl`);
+      if (existsSync(filePath)) writeFileSync(filePath, "");
+    } catch (_) { }
+  }
+
+  // recompute totals
+  manager.totalPixels = manager.template?.data
+    ? manager.template.data.flat().filter((p) => (manager.paintTransparentPixels ? p >= 0 : p > 0)).length
+    : 0;
+
+  // reset remaining counter if template definition changed or totals differ
+  try {
+    if (!manager.running) {
+      manager.pixelsRemaining = manager.totalPixels;
+      manager.status = "Waiting to be started.";
+    }
+  } catch (_) { }
+
+  saveTemplates();
+  res.sendStatus(200);
+});
+
+// Clear heatmap history for a template
+app.delete("/template/:id/heatmap", (req, res) => {
+  const { id } = req.params;
+  if (!id) return res.sendStatus(400);
+  const filePath = path.join(heatMapsDir, `${id}.jsonl`);
+  try {
+    if (existsSync(filePath)) writeFileSync(filePath, "");
+    return res.status(200).json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: String(e && e.message || e) });
+  }
+});
+
+app.put("/template/:id", async (req, res) => {
+  const { id } = req.params;
+  if (!id || !templates[id]) return res.sendStatus(400);
+  const manager = templates[id];
+  if (req.body.running && !manager.running) {
+    manager.start().catch((error) => log(id, manager.masterName, "Error starting template", error));
+  } else {
+    if (manager.running && req.body.running === false) {
+      log("SYSTEM", "wplacer", `[${manager.name}] ⏹️ Template manually stopped by user.`);
+    }
+    manager.running = false;
+    try { if (typeof manager.interruptSleep === 'function') manager.interruptSleep(); } catch (_) { }
+  }
+  res.sendStatus(200);
+});
+
+// --- API: settings (now only drawingMethod + seedCount relevant from paint side) ---
+app.get("/settings", (_, res) => res.json({ ...currentSettings, proxyCount: loadedProxies.length }));
+app.post("/reload-proxies", (req, res) => {
+  loadProxies();
+  res.status(200).json({ success: true, count: loadedProxies.length });
+});
+app.get("/test-proxies", async (req, res) => {
+  try {
+    if (!currentSettings.proxyEnabled || loadedProxies.length === 0) {
+      return res.status(400).json({ error: "no_proxies_loaded" });
+    }
+
+    const concurrency = Math.max(1, Math.min(32, parseInt(String(req.query.concurrency || "5"), 10) || 5));
+    const target = String(req.query.target || "tile").toLowerCase();
+    const isMe = target === "me";
+    const targetUrl = isMe
+      ? "https://bplace.org/me"
+      : String(req.query.url || "https://bplace.org/files/s0/tiles/0/0.png");
+
+    const toTest = loadedProxies.map((p, i) => ({
+      idx: Number(p._idx) || (i + 1),
+      host: p.host,
+      port: p.port,
+      protocol: p.protocol,
+      username: p.username,
+      password: p.password
+    }));
+
+    const cloudflareRe = /cloudflare|attention required|access denied|just a moment|cf-ray|challenge-form|cf-chl/i;
+    const buildProxyUrl = (p) => {
+      let s = `${p.protocol}://`;
+      if (p.username && p.password) s += `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@`;
+      s += `${p.host}:${p.port}`;
+      return s;
+    };
+
+    const results = new Array(toTest.length);
+    let cursor = 0;
+    const runWorker = async () => {
+      while (true) {
+        const n = cursor++;
+        if (n >= toTest.length) return;
+        const item = toTest[n];
+        const started = Date.now();
+        let outcome = { idx: item.idx, proxy: `${item.host}:${item.port}`, ok: false, status: 0, reason: "", elapsedMs: 0 };
+        try {
+          const imp = new Impit({ browser: "chrome", ignoreTlsErrors: true, proxyUrl: buildProxyUrl(item) });
+          try { log("SYSTEM", "wplacer", `🧪 Testing proxy #${item.idx} (${item.host}:${item.port}) target=${isMe ? '/me' : '/tile'}`); } catch (_) { }
+
+          const controller = new AbortController();
+          const timeoutMs = 10000;
+          const t = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const r = await imp.fetch(targetUrl, {
+              headers: isMe
+                ? {
+                  Accept: "application/json, text/plain, */*",
+                  "X-Requested-With": "XMLHttpRequest",
+                  Referer: "https://bplace.org/",
+                  Origin: "https://bplace.org",
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                  "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+                  "Sec-Fetch-Dest": "empty",
+                  "Sec-Fetch-Mode": "cors",
+                  "Sec-Fetch-Site": "same-site"
+                }
+                : { Accept: "image/*", Referer: "https://bplace.org/" },
+              redirect: "manual",
+              signal: controller.signal
+            });
+            clearTimeout(t);
+            const ct = (r.headers.get("content-type") || "").toLowerCase();
+            if (!isMe) {
+              if (r.ok && (ct.includes("image/") || ct.includes("application/octet-stream"))) {
+                outcome.ok = true;
+                outcome.status = r.status;
+                outcome.reason = "ok";
+              } else {
+                let text = "";
+                try { text = await r.text(); } catch (_) { text = ""; }
+                if (cloudflareRe.test(text)) {
+                  outcome.reason = "cloudflare_block";
+                } else if (r.status) {
+                  outcome.reason = `http_${r.status}`;
+                } else {
+                  outcome.reason = (text || "non_image_response").slice(0, 140);
+                }
+                outcome.status = r.status || 0;
+              }
+            } else {
+              // Strict /me target: OK if reachable without CF challenge (expect 401 JSON or 200 JSON)
+              let text = "";
+              try { text = await r.text(); } catch (_) { text = ""; }
+              if (cloudflareRe.test(text)) {
+                outcome.ok = false;
+                outcome.reason = "cloudflare_block";
+              } else if (r.status >= 300 && r.status < 400) {
+                outcome.ok = false;
+                outcome.reason = `redirect_${r.status}`;
+              } else if (ct.includes("application/json")) {
+                outcome.ok = (r.status === 200 || r.status === 401);
+                outcome.reason = r.status === 200 ? "ok_me_200" : (r.status === 401 ? "ok_me_401" : `http_${r.status}`);
+              } else if (r.status === 403) {
+                outcome.ok = false;
+                outcome.reason = "http_403";
+              } else {
+                outcome.ok = false;
+                outcome.reason = (text || `http_${r.status || 0}`).slice(0, 140);
+              }
+              outcome.status = r.status || 0;
+            }
+          } catch (e) {
+            if (String(e && e.name).toLowerCase() === "aborterror") {
+              outcome.reason = "timeout";
+            } else {
+              const msg = String(e && (e.message || e)).toLowerCase();
+              if (/econnreset|timeout|timed out|socket hang up|enotfound|econnrefused|reqwest::error|hyper_util/i.test(msg)) {
+                outcome.reason = "network_error";
+              } else {
+                outcome.reason = (e && (e.message || String(e)) || "error").slice(0, 160);
+              }
+            }
+          }
+        } catch (e) {
+          outcome.reason = (e && (e.message || String(e)) || "error").slice(0, 160);
+        } finally {
+          outcome.elapsedMs = Date.now() - started;
+          results[n] = outcome;
+          try {
+            const tag = outcome.ok ? 'OK' : 'BLOCKED';
+            log("SYSTEM", "wplacer", `🧪 Proxy #${outcome.idx} ${tag} (${outcome.status}) ${outcome.reason}; ${outcome.elapsedMs} ms`);
+          } catch (_) { }
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, toTest.length) }, () => runWorker()));
+    const okCount = results.filter(r => r && r.ok).length;
+    const blockedCount = results.length - okCount;
+    res.json({ total: results.length, ok: okCount, blocked: blockedCount, results });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+app.get("/test-proxy", async (req, res) => {
+  try {
+    if (!currentSettings.proxyEnabled || loadedProxies.length === 0) {
+      return res.status(400).json({ error: "no_proxies_loaded" });
+    }
+    const idx = Math.max(1, parseInt(String(req.query.idx || "0"), 10) || 0);
+    const target = String(req.query.target || "me").toLowerCase();
+    const isMe = target === "me";
+    const targetUrl = isMe ? "https://bplace.org/me" : "https://bplace.org/files/s0/tiles/0/0.png";
+
+    const p = loadedProxies.find((x, i) => Number(x._idx) === idx) || loadedProxies[idx - 1];
+    if (!p) return res.status(404).json({ error: "proxy_not_found" });
+
+    const cloudflareRe = /cloudflare|attention required|access denied|just a moment|cf-ray|challenge-form|cf-chl/i;
+    const buildProxyUrl = (pp) => {
+      let s = `${pp.protocol}://`;
+      if (pp.username && pp.password) s += `${encodeURIComponent(pp.username)}:${encodeURIComponent(pp.password)}@`;
+      s += `${pp.host}:${pp.port}`;
+      return s;
+    };
+
+    const started = Date.now();
+    let outcome = { idx, proxy: `${p.host}:${p.port}`, ok: false, status: 0, reason: "", elapsedMs: 0 };
+    try {
+      const imp = new Impit({ browser: "chrome", ignoreTlsErrors: true, proxyUrl: buildProxyUrl(p) });
+      try { log("SYSTEM", "wplacer", `🧪 Testing proxy #${idx} (${p.host}:${p.port}) target=${isMe ? '/me' : '/tile'}`); } catch (_) { }
+      const controller = new AbortController();
+      const timeoutMs = 10000;
+      const t = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const r = await imp.fetch(targetUrl, {
+          headers: isMe
+            ? {
+              Accept: "application/json, text/plain, */*",
+              "X-Requested-With": "XMLHttpRequest",
+              Referer: "https://bplace.org/",
+              Origin: "https://bplace.org",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+              "Sec-Fetch-Dest": "empty",
+              "Sec-Fetch-Mode": "cors",
+              "Sec-Fetch-Site": "same-site"
+            }
+            : { Accept: "image/*", Referer: "https://bplace.org/" },
+          redirect: "manual",
+          signal: controller.signal
+        });
+        clearTimeout(t);
+        const ct = (r.headers.get("content-type") || "").toLowerCase();
+        if (!isMe) {
+          if (r.ok && (ct.includes("image/") || ct.includes("application/octet-stream"))) {
+            outcome.ok = true;
+            outcome.status = r.status;
+            outcome.reason = "ok";
+          } else {
+            let text = "";
+            try { text = await r.text(); } catch (_) { text = ""; }
+            if (cloudflareRe.test(text)) outcome.reason = "cloudflare_block";
+            else if (r.status) outcome.reason = `http_${r.status}`;
+            else outcome.reason = (text || "non_image_response").slice(0, 140);
+            outcome.status = r.status || 0;
+          }
+        } else {
+          let text = "";
+          try { text = await r.text(); } catch (_) { text = ""; }
+          if (cloudflareRe.test(text)) { outcome.ok = false; outcome.reason = "cloudflare_block"; }
+          else if (r.status >= 300 && r.status < 400) { outcome.ok = false; outcome.reason = `redirect_${r.status}`; }
+          else if (ct.includes("application/json")) { outcome.ok = (r.status === 200 || r.status === 401); outcome.reason = r.status === 200 ? "ok_me_200" : (r.status === 401 ? "ok_me_401" : `http_${r.status}`); }
+          else if (r.status === 403) { outcome.ok = false; outcome.reason = "http_403"; }
+          else { outcome.ok = false; outcome.reason = (text || `http_${r.status || 0}`).slice(0, 140); }
+          outcome.status = r.status || 0;
+        }
+      } catch (e) {
+        if (String(e && e.name).toLowerCase() === "aborterror") outcome.reason = "timeout";
+        else {
+          const msg = String(e && (e.message || e)).toLowerCase();
+          if (/econnreset|timeout|timed out|socket hang up|enotfound|econnrefused|reqwest::error|hyper_util/i.test(msg)) outcome.reason = "network_error";
+          else outcome.reason = (e && (e.message || String(e)) || "error").slice(0, 160);
+        }
+      }
+    } catch (e) {
+      outcome.reason = (e && (e.message || String(e)) || "error").slice(0, 160);
+    } finally {
+      outcome.elapsedMs = Date.now() - started;
+      try {
+        const tag = outcome.ok ? 'OK' : 'BLOCKED';
+        log("SYSTEM", "wplacer", `🧪 Proxy #${idx} ${tag} (${outcome.status}) ${outcome.reason}; ${outcome.elapsedMs} ms`);
+      } catch (_) { }
+    }
+    res.json(outcome);
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+app.post("/proxies/cleanup", (req, res) => {
+  try {
+    const keepIdx = Array.isArray(req.body?.keepIdx) ? req.body.keepIdx.map(n => parseInt(n, 10)).filter(n => Number.isFinite(n) && n > 0) : null;
+    const removeIdx = Array.isArray(req.body?.removeIdx) ? req.body.removeIdx.map(n => parseInt(n, 10)).filter(n => Number.isFinite(n) && n > 0) : null;
+    if (!keepIdx && !removeIdx) return res.status(400).json({ error: "no_selection" });
+
+    const proxyPath = path.join(dataDir, "proxies.txt");
+    const backupPath = path.join(proxiesBackupsDir, `proxies.backup-${new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')}.txt`);
+    try { writeFileSync(backupPath, readFileSync(proxyPath, "utf8")); } catch (_) { }
+
+    const byIdx = new Map();
+    for (const p of loadedProxies) {
+      const index = Number(p._idx) || (loadedProxies.indexOf(p) + 1);
+      byIdx.set(index, p);
+    }
+    const shouldKeep = (idx) => {
+      if (keepIdx) return keepIdx.includes(idx);
+      if (removeIdx) return !removeIdx.includes(idx);
+      return true;
+    };
+    const kept = [];
+    for (const [idx, p] of byIdx.entries()) {
+      if (!shouldKeep(idx)) continue;
+      const auth = (p.username && p.password) ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@` : "";
+      kept.push(`${p.protocol}://${auth}${p.host}:${p.port}`);
+    }
+    writeFileSync(proxyPath, kept.join("\n") + (kept.length ? "\n" : ""));
+    loadProxies();
+    res.json({ success: true, kept: kept.length, removed: byIdx.size - kept.length, backup: path.basename(backupPath), count: loadedProxies.length });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+app.put("/settings", (req, res) => {
+  const patch = { ...req.body };
+  // merge nested logCategories toggles
+  if (patch.logCategories && typeof patch.logCategories === 'object') {
+    const curr = currentSettings.logCategories || {};
+    currentSettings.logCategories = { ...curr, ...patch.logCategories };
+    delete patch.logCategories;
+  }
+  if (typeof patch.logMaskPii !== 'undefined') {
+    currentSettings.logMaskPii = !!patch.logMaskPii;
+    delete patch.logMaskPii;
+  }
+
+  // sanitize seedCount like in old version
+  if (typeof patch.seedCount !== "undefined") {
+    let n = Number(patch.seedCount);
+    if (!Number.isFinite(n)) n = 2;
+    n = Math.max(1, Math.min(16, Math.floor(n)));
+    patch.seedCount = n;
+  }
+
+  // sanitize chargeThreshold
+  if (typeof patch.chargeThreshold !== "undefined") {
+    let t = Number(patch.chargeThreshold);
+    if (!Number.isFinite(t)) t = 0.5;
+    t = Math.max(0, Math.min(1, t));
+    patch.chargeThreshold = t;
+  }
+
+  // sanitize maxPixelsPerPass (0 = unlimited)
+  if (typeof patch.maxPixelsPerPass !== "undefined") {
+    let m = Number(patch.maxPixelsPerPass);
+    if (!Number.isFinite(m)) m = 0;
+    m = Math.max(0, Math.floor(m));
+    patch.maxPixelsPerPass = m;
+  }
+
+  const oldSettings = { ...currentSettings };
+  currentSettings = { ...currentSettings, ...patch };
+  saveSettings();
+
+  // if cooldown/threshold changed — refresh runtime timers without restart
+  const accountCooldownChanged = oldSettings.accountCooldown !== currentSettings.accountCooldown;
+  const thresholdChanged = oldSettings.chargeThreshold !== currentSettings.chargeThreshold;
+  if (accountCooldownChanged || thresholdChanged) {
+    for (const id in templates) {
+      const m = templates[id]; if (!m) continue;
+      if (typeof m._summaryMinIntervalMs === 'number') {
+        const ac = currentSettings.accountCooldown || 0;
+        m._summaryMinIntervalMs = Math.max(2 * ac, 5000);
+      }
+      if (m.running && typeof m.interruptSleep === 'function') m.interruptSleep();
+    }
+  }
+
+  res.sendStatus(200);
+});
+
+// --- API: canvas passthrough (unchanged) ---
+app.get("/canvas", async (req, res) => {
+  const { tx, ty } = req.query;
+  if (isNaN(parseInt(tx)) || isNaN(parseInt(ty))) return res.sendStatus(400);
+  try {
+    const url = `https://bplace.org/files/s0/tiles/${tx}/${ty}.png`;
+    let buffer;
+
+    const useProxy = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+    if (useProxy) {
+      // Fetch via Impit to respect proxy settings (no cookies needed)
+      const impitOptions = { browser: "chrome", ignoreTlsErrors: true };
+      const proxySel = getNextProxy();
+      if (proxySel) {
+        impitOptions.proxyUrl = proxySel.url;
+        if (currentSettings.logProxyUsage) {
+          log("SYSTEM", "wplacer", `Using proxy #${proxySel.idx}: ${proxySel.display}`);
+        }
+      }
+      const imp = new Impit(impitOptions);
+      const resp = await imp.fetch(url, { headers: { Accept: "image/*" } });
+      if (!resp.ok) return res.sendStatus(resp.status);
+      buffer = Buffer.from(await resp.arrayBuffer());
+    } else {
+      const response = await fetch(url);
+      if (!response.ok) return res.sendStatus(response.status);
+      buffer = Buffer.from(await response.arrayBuffer());
+    }
+
+    res.json({ image: `data:image/png;base64,${buffer.toString("base64")}` });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// (heatmap API removed)
+
+// --- API: version check ---
+app.get("/version", async (_req, res) => {
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(process.cwd(), "package.json"), "utf8"));
+    const local = String(pkg.version || "0.0.0");
+    let latest = local;
+    try {
+      const r = await fetch("https://raw.githubusercontent.com/lllexxa/wplacer/main/package.json", { cache: "no-store" });
+      if (r.ok) {
+        const remote = await r.json();
+        latest = String(remote.version || latest);
+      }
+    } catch (_) { }
+
+    const cmp = (a, b) => {
+      const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+      const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const da = pa[i] || 0, db = pb[i] || 0;
+        if (da !== db) return da - db;
+      }
+      return 0;
+    };
+    const outdated = cmp(local, latest) < 0;
+    res.json({ local, latest, outdated });
+  } catch (e) {
+    res.status(500).json({ error: "version_check_failed" });
+  }
+});
+
+// --- API: changelog (local + remote) ---
+app.get("/changelog", async (_req, res) => {
+  try {
+    let local = "";
+    try { local = readFileSync(path.join(process.cwd(), "CHANGELOG.md"), "utf8"); } catch (_) { }
+    let remote = "";
+    try {
+      const r = await fetch("https://raw.githubusercontent.com/lllexxa/wplacer/main/CHANGELOG.md", { cache: "no-store" });
+      if (r.ok) remote = await r.text();
+    } catch (_) { }
+    res.json({ local, remote });
+  } catch (e) {
+    res.status(500).json({ error: "changelog_fetch_failed" });
+  }
+});
+
+
+// --- Keep-Alive (parallel with proxies) ---
+const keepAlive = async () => {
+  if (activeBrowserUsers.size > 0) {
+    log("SYSTEM", "wplacer", "⚙️ Deferring keep-alive check: a browser operation is active.");
+    return;
+  }
+
+  const allIds = Object.keys(users);
+  const candidates = allIds.filter((uid) => {
+    if (activeBrowserUsers.has(uid)) return false;
+    const rec = users[uid];
+    if (!rec) return false;
+    if (rec.authFailureUntil && Date.now() < rec.authFailureUntil) return false;
+    return true;
+  });
+  if (candidates.length === 0) {
+    log("SYSTEM", "wplacer", "⚙️ Keep-alive: no idle users to check.");
+    return;
+  }
+
+  const useParallel = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
+  if (useParallel) {
+    // Run in parallel using a pool roughly equal to proxy count (capped)
+    const desired = Math.max(1, Math.floor(Number(currentSettings.parallelWorkers || 0)) || 1);
+    const concurrency = Math.max(1, Math.min(desired, loadedProxies.length || desired, 32));
+    log("SYSTEM", "wplacer", `⚙️ Performing parallel keep-alive for ${candidates.length} users (concurrency=${concurrency}, proxies=${loadedProxies.length}).`);
+
+    let index = 0;
+    const worker = async () => {
+      for (; ;) {
+        const myIndex = index++;
+        if (myIndex >= candidates.length) break;
+        const userId = candidates[myIndex];
+        if (!users[userId]) continue;
+        if (activeBrowserUsers.has(userId)) continue;
+        activeBrowserUsers.add(userId);
+        const wplacer = new WPlacer();
+        try {
+          await wplacer.login(users[userId].cookies);
+          // Clear auth failure flag on successful keep-alive
+          if (users[userId].authFailureUntil) {
+            delete users[userId].authFailureUntil;
+            saveUsers();
+          }
+          log(userId, users[userId].name, "✅ Cookie keep-alive successful.");
+        } catch (error) {
+          // Handle authentication errors in keep-alive
+          if (error.message && (error.message.includes("Authentication failed (401)") || error.message.includes("Authentication expired"))) {
+            if (!users[userId].authFailureUntil) {
+              users[userId].authFailureUntil = Date.now() + (5 * 60 * 1000); // 5 minutes
+              saveUsers();
+            }
+          }
+          // Always delegate to unified error logger to keep original messages
+          logUserError(error, userId, users[userId].name, "perform keep-alive check");
+        } finally {
+          activeBrowserUsers.delete(userId);
+        }
+        const cd = Math.max(0, Number(currentSettings.keepAliveCooldown || 0));
+        if (cd > 0) await sleep(cd);
+      }
+    };
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    log("SYSTEM", "wplacer", "✅ Keep-alive check complete (parallel).");
+    return;
+  }
+
+  // Fallback: sequential with delay between users
+  log("SYSTEM", "wplacer", "⚙️ Performing sequential cookie keep-alive check for all users...");
+  for (const userId of candidates) {
+    if (activeBrowserUsers.has(userId)) {
+      log(userId, users[userId].name, "⚠️ Skipping keep-alive check: user is currently busy.");
+      continue;
+    }
+    if (users[userId].authFailureUntil && Date.now() < users[userId].authFailureUntil) {
+      log(userId, users[userId].name, "⚠️ Skipping keep-alive check: user has recent auth failure.");
+      continue;
+    }
+    activeBrowserUsers.add(userId);
+    const wplacer = new WPlacer();
+    try {
+      await wplacer.login(users[userId].cookies);
+      // Clear auth failure flag on successful keep-alive
+      if (users[userId].authFailureUntil) {
+        delete users[userId].authFailureUntil;
+        saveUsers();
+      }
+      log(userId, users[userId].name, "✅ Cookie keep-alive successful.");
+    } catch (error) {
+      // Handle authentication errors in keep-alive
+      if (error.message && (error.message.includes("Authentication failed (401)") || error.message.includes("Authentication expired"))) {
+        if (!users[userId].authFailureUntil) {
+          users[userId].authFailureUntil = Date.now() + (5 * 60 * 1000); // 5 minutes
+          saveUsers();
+        }
+        log(userId, users[userId].name, "🛑 Cookies expired (401/403) - skipping user temporarily");
+      } else {
+        logUserError(error, userId, users[userId].name, "perform keep-alive check");
+      }
+    } finally {
+      activeBrowserUsers.delete(userId);
+    }
+    await sleep(currentSettings.keepAliveCooldown);
+  }
+  log("SYSTEM", "wplacer", "✅ Keep-alive check complete (sequential).");
+};
+
+// -- Export JWT Tokens --
+
+app.get('/export-tokens', (req, res) => {
+  try {
+    const usersPath = path.join(__dirname, 'data', 'users.json');
+
+    if (!fs.existsSync(usersPath)) {
+      return res.status(404).send('users.json not found.');
+    }
+
+    const rawData = fs.readFileSync(usersPath, 'utf8');
+    const users = JSON.parse(rawData);
+
+    // Extract tokens JWT Tokens from each user
+    const tokens = Object.values(users)
+      .map(user => user.cookies?.j)
+      .filter(Boolean)
+      .map(s => s.trim());
+
+    if (tokens.length === 0) {
+      return res.status(404).send('No tokens found.');
+    }
+
+    const textContent = tokens.join('\n');
+
+    // Headers to force download as file.txt
+    res.setHeader('Content-Disposition', 'attachment; filename="jwt_tokens.txt"');
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(textContent);
+
+  } catch (err) {
+    console.error('An error ocurred while trying to export tokens:', err);
+    res.status(500).send('An error occurred while exporting JWT tokens.');
+  }
+});
+
+// --- Startup ---
+(async () => {
+  console.clear();
+  const version = JSON.parse(readFileSync("package.json", "utf8")).version;
+  console.log(`\n--- wplacer v${version} made by luluwaffless and jinx | forked/improved by lllexxa ---\n`);
+  
+  // Add startup message to Live Logs
+  addToLiveLogs(`--- wplacer v${version} made by luluwaffless and jinx | forked/improved by lllexxa ---`);
+
+  const loadedTemplates = loadJSON("templates.json");
+  for (const id in loadedTemplates) {
+    const t = loadedTemplates[id];
+    if (t.userIds?.every((uid) => users[uid])) {
+      const tm = new TemplateManager(
+        t.name,
+        t.template,
+        t.coords,
+        t.canBuyCharges,
+        t.canBuyMaxCharges,
+        t.antiGriefMode,
+        t.userIds,
+        !!t.paintTransparentPixels,
+
+        !!t.skipPaintedPixels,
+        !!t.outlineMode
+      );
+      tm.burstSeeds = t.burstSeeds || null;
+      tm.autoBuyNeededColors = !!t.autoBuyNeededColors;
+      // heatmap settings load
+      try {
+        tm.heatmapEnabled = !!t.heatmapEnabled;
+        const lim = Math.max(0, Math.floor(Number(t.heatmapLimit)));
+        tm.heatmapLimit = lim > 0 ? lim : 10000;
+      } catch (_) { tm.heatmapEnabled = false; tm.heatmapLimit = 10000; }
+      
+      // auto-start setting load
+      tm.autoStart = !!t.autoStart;
+      
+      templates[id] = tm;
+    } else {
+      console.warn(`⚠️ Template "${t.name}" was not loaded because its assigned user(s) no longer exist.`);
+    }
+  }
+
+  loadProxies();
+  console.log(`✅ Loaded ${Object.keys(templates).length} templates, ${Object.keys(users).length} users and ${loadedProxies.length} proxies.`);
+  
+  // Add loaded data message to Live Logs
+  addToLiveLogs(`✅ Loaded ${Object.keys(templates).length} templates, ${Object.keys(users).length} users and ${loadedProxies.length} proxies.`);
+  
+  const port = Number(process.env.PORT) || 80;
+  const host = process.env.HOST || "0.0.0.0";
+  const hostname = host === "0.0.0.0" || host === "127.0.0.1" ? "localhost" : host;
+
+  // Security warning for 0.0.0.0
+  if (host === "0.0.0.0") {
+    const securityWarning1 = "⚠️  SECURITY WARNING: HOST=0.0.0.0 makes the server accessible from outside your computer!";
+    const securityWarning2 = "   For better security, change HOST to 127.0.0.1 in .env file or use run-localhost.bat";
+    
+    console.log(securityWarning1);
+    console.log(securityWarning2);
+    console.log("");
+    
+    // Add security warning to Live Logs
+    addToLiveLogs(securityWarning1, 'general', 'warning');
+    addToLiveLogs(securityWarning2, 'general', 'warning');
+  }
+
+  const server = app.listen(port, host, () => {
+    const serverMsg1 = `✅ Server listening on http://${hostname}:${port} (${host})`;
+    const serverMsg2 = `   Open the web UI in your browser to start!`;
+    
+    console.log(serverMsg1);
+    console.log(serverMsg2);
+    
+    // Add server startup messages to Live Logs
+    addToLiveLogs(serverMsg1);
+    addToLiveLogs(serverMsg2);
+    
+    // Auto-start grief monitoring if enabled in settings
+  // Load griefers and history from unified file
+  loadGriefersFromFile();
+  
+  if (currentSettings.griefMonitoringEnabled) {
+    log("SYSTEM", "grief-monitor", "🚀 Auto-starting grief monitoring from settings...");
+    startGriefMonitoring();
+  }
+    
+    // Auto-open browser
+    const url = `http://${hostname}:${port}`;
+    exec(`start ${url}`, (error) => {
+      if (error) {
+        const browserErrorMsg = `   Failed to auto-open browser. Please open manually: ${url}`;
+        console.log(browserErrorMsg);
+        // Add browser error message to Live Logs
+        addToLiveLogs(browserErrorMsg, 'general', 'warning');
+      } else {
+        const browserSuccessMsg = `   🌐 Browser auto-opened: ${url}`;
+        console.log(browserSuccessMsg);
+        // Add browser success message to Live Logs
+        addToLiveLogs(browserSuccessMsg);
+      }
+    });
+    
+    setInterval(keepAlive, 20 * 60 * 1000);
+    
+    // Auto-start templates with autoStart enabled (after server is fully started)
+    setTimeout(async () => {
+      let autoStartedCount = 0;
+      for (const [id, template] of Object.entries(templates)) {
+        if (template.autoStart && !template.running) {
+          try {
+            Promise.resolve().then(() => template.start()).catch(err => console.error(`❌ Failed to auto-start template \"${template?.name || 'unknown'}\"`, err));
+            autoStartedCount++;
+            console.log(`🚀 Auto-started template: ${template.name}`);
+          } catch (error) {
+            console.error(`❌ Failed to auto-start template "${template.name}":`, error.message);
+          }
+        }
+      }
+      if (autoStartedCount > 0) {
+        console.log(`✅ Auto-started ${autoStartedCount} template(s)`);
+      }
+    }, 1000); // Wait 1 second after server start
+  });
+  try {
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+  } catch (_) { }
+  // Process-level safety nets and graceful shutdown
+  try {
+    process.on('uncaughtException', (err) => {
+      console.error('[Process] uncaughtException:', err?.stack || err);
+      try { appendFileSync(path.join(dataDir, 'errors.log'), `[${new Date().toLocaleString()}] uncaughtException: ${err?.stack || err}\n`); } catch (_) { }
+    });
+    process.on('unhandledRejection', (reason) => {
+      console.error('[Process] unhandledRejection:', reason);
+      try { appendFileSync(path.join(dataDir, 'errors.log'), `[${new Date().toLocaleString()}] unhandledRejection: ${reason}\n`); } catch (_) { }
+    });
+    const shutdown = () => {
+      console.log('Shutting down server...');
+      try { server.close(() => {
+          try { for (const s of Array.from(sockets)) { try { s.destroy(); } catch {} } } catch {}
+          process.exit(0);
+        });
+        // Fallback: hard exit after 2s
+        setTimeout(() => { try { for (const s of Array.from(sockets)) { try { s.destroy(); } catch {} } } catch {}; process.exit(0); }, 2000);
+      } catch (_) { process.exit(0); }
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  } catch (_) { }
+})();

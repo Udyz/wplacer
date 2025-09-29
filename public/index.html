@@ -1,0 +1,1339 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/x-icon" href="icons/favicon.png" />
+    <link rel="stylesheet" href="styles/index.css" />
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <title>wplacer</title>
+
+    <!-- Small helper style to highlight selected mode card -->
+    <style>
+        .mode-card.selected {
+            box-shadow: 0 0 0 3px var(--ring);
+            border-color: var(--accent);
+            transform: translateY(-2px);
+        }
+
+        .mode-card .seed-input {
+            margin-top: 8px;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .mode-card .seed-input input {
+            width: 64px;
+        }
+    </style>
+    <script src="https://twemoji.maxcdn.com/v/latest/twemoji.min.js" crossorigin="anonymous"
+        referrerpolicy="no-referrer"></script>
+</head>
+
+<body>
+    <!-- Skip link for accessibility -->
+    <a class="skip-link" href="#main">Skip navigation</a>
+
+    <!-- App Shell -->
+    <header class="app-header">
+        <div class="brand">
+            <img src="icons/favicon.png" alt="" aria-hidden="true" />
+            <span>wplacer</span>
+        </div>
+
+        <div class="header-actions">
+            <button class="ghost-btn" onclick="changeTab(main)" title="Home">
+                <img src="icons/return.svg" alt="" />
+                <span class="hide-sm">Home</span>
+            </button>
+            <button class="ghost-btn" onclick="changeTab(settings)" title="Settings">
+                <img src="icons/settings.svg" alt="" />
+                <span class="hide-sm">Settings</span>
+            </button>
+        </div>
+    </header>
+
+    <div class="app-layout">
+        <!-- Persistent Nav -->
+        <aside class="app-nav" aria-label="Primary">
+            <button class="nav-btn" onclick="changeTab(main)">
+                <img src="icons/return.svg" alt="" />
+                <span>Dashboard</span>
+            </button>
+            <button class="nav-btn" onclick="document.getElementById('openManageUsers').click()">
+                <img src="icons/manageUsers.svg" alt="" />
+                <span>Manage Users</span>
+            </button>
+            <button class="nav-btn" onclick="document.getElementById('openAddTemplate').click()">
+                <img src="icons/addTemplate.svg" alt="" />
+                <span>Add Template</span>
+            </button>
+            <button class="nav-btn" onclick="document.getElementById('openManageTemplates').click()">
+                <img src="icons/manageTemplates.svg" alt="" />
+                <span>Manage Templates</span>
+            </button>
+            <button class="nav-btn" onclick="changeTab(colorsManager)">
+                <img src="icons/palette.svg" alt="" />
+                <span>Colors</span>
+            </button>
+            <button class="nav-btn" onclick="changeTab(flagsManager)">
+                <img src="icons/pin.svg" alt="" />
+                <span>Flags</span>
+            </button>
+            <button class="nav-btn" onclick="changeTab(liveLogs)">
+                <img src="icons/code.svg" alt="" />
+                <span>Live Logs</span>
+            </button>
+            <button class="nav-btn" onclick="changeTab(queuePreview)">
+                <img src="icons/heat-map.svg" alt="" />
+                <span>Queue</span>
+            </button>
+            <button class="nav-btn" onclick="changeTab(griefers)">
+                <img src="icons/report.svg" alt="" />
+                <span>Grief Monitor</span>
+                </button>
+            <button class="nav-btn" onclick="document.getElementById('openSettings').click()">
+                <img src="icons/settings.svg" alt="" />
+                <span>Settings</span>
+            </button>
+        </aside>
+
+        <!-- Content -->
+        <main class="app-content">
+            <div class="container">
+                <!-- ====== HOME ====== -->
+                <h1 class="visually-hidden">wplacer</h1>
+                <section id="main">
+                    <div class="hero">
+                        <div class="hero-title">
+                            <img src="icons/favicon.png" alt="" aria-hidden="true" />
+                            <h2>Dashboard</h2>
+                        </div>
+                        <p class="hero-sub">Quick actions</p>
+
+                        <div class="quick-actions">
+                            <button id="openManageUsers" class="primary-button card-button">
+                                <img src="icons/manageUsers.svg" alt="" />
+                                <div class="qa-label">
+                                    <span>Manage Users</span>
+                                    <small>Add / check accounts</small>
+                                </div>
+                            </button>
+
+                            <button id="openAddTemplate" class="primary-button card-button">
+                                <img src="icons/addTemplate.svg" alt="" />
+                                <div class="qa-label">
+                                    <span>Add Template</span>
+                                    <small>Create a new template</small>
+                                </div>
+                            </button>
+
+                            <button id="openManageTemplates" class="primary-button card-button">
+                                <img src="icons/manageTemplates.svg" alt="" />
+                                <div class="qa-label">
+                                    <span>Manage Templates</span>
+                                    <small>Run / edit templates</small>
+                                </div>
+                            </button>
+
+                            <button id="openSettings" class="primary-button card-button">
+                                <img src="icons/settings.svg" alt="" />
+                                <div class="qa-label">
+                                    <span>Settings</span>
+                                    <small>Modes, cooldowns</small>
+                                </div>
+                            </button>
+
+                            <button id="openChangelog" class="primary-button card-button">
+                                <img src="icons/code.svg" alt="" />
+                                <div class="qa-label">
+                                    <span>Changelog</span>
+                                    <small>What’s new</small>
+                                </div>
+                            </button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ====== MANAGE USERS ====== -->
+                <section id="manageUsers" style="display:none;">
+                    <header class="section-head">
+                        <h2>Users</h2>
+                        <div class="section-actions">
+
+                            <button id="checkUserStatus" class="secondary-button">
+                                <img src="icons/check.svg" alt="" />
+                                Check Account Status
+                            </button>
+
+                            <button id="showLatestInfo" class="secondary-button">Show Latest Info</button>
+
+                            <button id="HideSensInfo" class="secondary-button">Hide Sensitive Info</button>
+
+                        </div>
+                    </header>
+
+                    <form id="userForm" class="form-card" autocomplete="off">
+                        <div class="field">
+                            <label for="jcookie">JWT Cookie (j)</label>
+                            <input type="password" id="jcookie" required placeholder="Paste JWT cookie" />
+                            <small class="help">Required. Used for authentication.</small>
+                        </div>
+                        <div class="field">
+                            <label for="scookie">Session Cookie (s) <span class="muted">[optional]</span></label>
+                            <input type="password" id="scookie" placeholder="Paste session cookie" />
+                            <small class="help">Optional. Helps to avoid captcha / login.</small>
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" id="submitUser" class="primary-button">
+                                <img src="icons/addUser.svg" alt="" /> Add User
+                            </button>
+
+                            <div>
+                                <button id="importJwtBtn" class="primary-button" type="button">
+                                    <img src="icons/addUser.svg" alt="">Import JWT Tokens (.txt)</button>
+                                <input type="file" id="importJwtFile" accept=".txt" style="display: none;">
+                            </div>
+                            <div>
+                                <button id="exportJwtBtn" class="primary-button" type="button">
+                                    <img src="icons/addUser.svg" alt="">Export JWT Tokens (.txt)</button>
+                            </div>
+                        </div>
+                        <div class="form-actions">
+                            <button id="buyMaxUpgradesAll" class="primary-button">
+                                <img src="icons/playAll.svg" alt="" />
+                                Buy Max Charge Upgrades (All)
+                            </button>
+                            <button id="buyChargesAll" class="primary-button">
+                                <img src="icons/playAll.svg" alt="" />
+                                Buy paint charges (All)
+                            </button>
+                        </div>
+                    </form>
+
+                    <h3 class="section-title" id="manageUsersTitle">Existing Users</h3>
+
+                    <div id="chargeSummary" class="summary">
+                        <div class="summary-line">
+                            <span><b>Last Check:</b> <span id="usersColorsLastCheckLabel">–</span></span>
+                        </div>
+                    </div>
+
+                    <div id="chargeSummary" class="summary">
+                        <div class="exist-users-summary-line">
+                            <span class="exist-users-info-section"><b>Total Charges:</b> <span
+                                    id="totalCharges">?</span> px /<span id="totalMaxCharges">?</span> px</span>
+                            <span class="exist-users-info-section"><b>Regen Speed:</b> <span id="regenPph">?</span>
+                                px/h</span>
+                            <span class="exist-users-info-section"><b>Total Droplets:</b> <span
+                                    id="totalDroplets">?</span></span>
+                        </div>
+                    </div>
+
+                    <div id="checkUsersProgress" class="summary" style="margin-top:8px; display:none;"></div>
+                    <div id="checkUsersResult" class="summary" style="margin-top:8px; display:none;"></div>
+                    <div id="cleanupExpiredWrap" style="margin-top:8px; display:none;">
+                        <button type="button" id="cleanupExpiredBtn" class="destructive-button">Remove expired/banned
+                            accounts
+                            (backup will be created)</button>
+                    </div>
+
+                    <div id="userList" class="cards-grid"></div>
+
+
+                </section>
+
+                <!-- ====== ADD TEMPLATE ====== -->
+                <section id="addTemplate" style="display:none;">
+                    <header class="section-head">
+                        <h2 id="templateFormTitle">Add Template</h2>
+                        <div class="section-actions">
+                            <button class="ghost-btn" onclick="changeTab(main); resetTemplateForm();">
+                                <img src="icons/return.svg" alt="" /> Return
+                            </button>
+                        </div>
+                    </header>
+
+                    <div class="uploader">
+                        <button id="convert" class="primary-button"
+                            onclick="document.getElementById('convertInput').click()">
+                            <img src="icons/convert.svg" alt="" /> Convert Image
+                        </button>
+                        <input type="file" accept="image/*" id="convertInput" style="display:none;" />
+                    </div>
+
+                    <div class="form-card">
+                        <small class="help-tip">
+                            <code>Tip:</code> For best results, process your image through the
+                            <a href="https://pepoafonso.github.io/color_converter_wplace/" target="_blank"
+                                rel="noopener noreferrer">wplace color converter</a> first!
+                        </small>
+                    </div>
+
+                    <div id="details" class="template-details" style="display:none;">
+                        <div class="preview-wrap">
+                            <canvas id="templateCanvas"></canvas>
+
+                            <div id="palettePanel" class="form-card" style="margin-top:12px;">
+
+                                <div class="field">
+                                    <label class="label-margin0">Image palette</label>
+                                    <small class="help">Used colors and pixel counts. Basic: ID 0–31, Premium:
+                                        32–63.</small>
+                                    <small class="help" id="editTmpltMsg" style="display: none;">NOTE: For already
+                                        uploaded
+                                        images you can only switch the palette from premium to basic, not the other way
+                                        around. To switch in the opposite direction, please re-upload the image.</small>
+                                </div>
+
+                                <div class="setting-toggle">
+                                    <label for="usePaidColors" class="label-margin0">Use premium (paid) colors</label>
+                                    <label class="switch" class="label-margin0">
+                                        <input id="usePaidColors" name="usePaidColors" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+
+                                <div id="paletteSummary" class="meta">
+                                    <span class="badge"><b>Size:</b> <span id="size"></span></span>
+                                    <span class="badge"><b>Painted pixels total:</b>
+                                        <span id="paletteTotal">0</span>
+                                    </span>
+                                    <span class="badge"><b>Unique colors:</b> <span id="paletteUnique">0</span></span>
+                                    <span class="badge" style="display: none;"><b>Charges needed:</b>
+                                        <span id="ink"></span>
+                                    </span>
+                                </div>
+                                <div id="paletteList" class="palette-grid"></div>
+                            </div>
+
+
+                        </div>
+
+
+                    </div>
+
+                    <form id="templateForm" class="form-card">
+                        <div class="field">
+                            <label for="templateName">Template Name</label>
+                            <input type="text" id="templateName" placeholder="You lost The Game" required />
+                        </div>
+
+                        <div class="field">
+                            <label>Coordinates</label>
+                            <div class="coordinate-grid">
+                                <input type="text" id="tx" placeholder="Tile X" required />
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="ty" placeholder="Tile Y"
+                                    required />
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="px" placeholder="Pixel X"
+                                    required />
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="py" placeholder="Pixel Y"
+                                    required />
+                            </div>
+                            <small class="help">You can paste URL like
+                                <code>.../pixel/{tx}/{ty}?x={px}&amp;y={py}</code> or string
+                                <code>(Tl X: {tx}, Tl Y: {ty}, Px X: {px}, Px Y: {py})</code> — fields will be
+                                parsed.</small>
+
+
+                            <div class="preview-controls">
+                                <button id="previewCanvasButton" class="secondary-button" type="button">
+                                    <img src="icons/eye.svg" alt="" /> Preview Canvas
+                                </button>
+
+                                <div class="inline-field">
+                                    <label for="previewBorder" class="label-margin0">Preview distance (px)</label>
+                                    <input type="number" id="previewBorder" min="0" value="0" />
+                                </div>
+                            </div>
+
+                            <canvas id="previewCanvas" style="display: none;"></canvas>
+                        </div>
+
+                        <div class="field">
+                            <label for="userSelectList">Users</label>
+                            <div id="userSelectList"></div>
+                            <div class="inline-actions">
+                                <button type="button" id="selectAllUsers" class="secondary-button">
+                                    <img src="icons/manageUsers.svg" alt="" /> Select All
+                                </button>
+                                <button type="button" id="unselectAllUsers" class="secondary-button">
+                                    <img src="icons/manageUsers.svg" alt="" /> Unselect All
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="toggles">
+                            <div class="setting-toggle">
+                                <label for="paintTransparent" class="label-margin0">Paint transparent pixels</label>
+                                <label class="switch" class="label-margin0">
+                                    <input id="paintTransparent" name="paintTransparent" type="checkbox" />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="setting-toggle">
+                                <label for="skipPaintedPixels" class="label-margin0">Skip painted pixels</label>
+                                <label class="switch" class="label-margin0">
+                                    <input id="skipPaintedPixels" name="skipPaintedPixels" type="checkbox" />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="setting-toggle">
+                                <label for="outlineMode" class="label-margin0">Outline-First mode</label>
+                                <label class="switch" class="label-margin0">
+                                    <input id="outlineMode" name="outlineMode" type="checkbox" />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="setting-toggle">
+                                <label for="antiGriefMode" class="label-margin0">Enable Anti-Grief mode</label>
+                                <label class="switch" class="label-margin0">
+                                    <input id="antiGriefMode" name="antiGriefMode" type="checkbox" />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="setting-toggle">
+                                <label for="heatmapEnabled" class="label-margin0">Save painting history
+                                    (heatmap)</label>
+                                <label class="switch" class="label-margin0">
+                                    <input id="heatmapEnabled" name="heatmapEnabled" type="checkbox" />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="setting-toggle">
+                                <label for="autoStart" class="label-margin0">Auto-start when program launches</label>
+                                <label class="switch" class="label-margin0">
+                                    <input id="autoStart" name="autoStart" type="checkbox" />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                            <div class="inline-field" id="heatmapLimitWrap" style="display:none;">
+                                <label for="heatmapLimit" class="label-margin0">History limit per template</label>
+                                <div class="input-affix">
+                                    <input type="number" id="heatmapLimit" min="1" value="10000" />
+                                    <span class="suffix">records</span>
+                                </div>
+                                <small class="help">Max entries in heatmap file. Oldest records are dropped.</small>
+                            </div>
+                        </div>
+
+                        <div class="settings-card" style="margin-top:10px; box-shadow: none;">
+                            <div class="settings-card-head">
+                                <h3 class="settings-card-title">Auto-purchases</h3>
+                                <p class="settings-card-sub">Prices: Buy paint charges — 500, Buy max charge upgrades —
+                                    500, Premium color — 2000; Don't forget about the droplets reserve specified in the
+                                    settings.</p>
+                            </div>
+                            <div class="toggles">
+                                <div class="setting-toggle">
+                                    <label for="canBuyMaxCharges" class="label-margin0">Buy max charge upgrades <span
+                                            class="muted">(500)</span></label>
+                                    <label class="switch" class="label-margin0">
+                                        <input id="canBuyMaxCharges" name="canBuyMaxCharges" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+
+                                <div class="setting-toggle">
+                                    <label for="canBuyCharges" class="label-margin0">Buy paint charges
+                                        <span class="muted">(500)</span></label>
+                                    <label class="switch" class="label-margin0">
+                                        <input id="canBuyCharges" name="canBuyCharges" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+
+                                <div class="setting-toggle">
+                                    <label for="autoBuyNeededColors" class="label-margin0">Auto-purchase needed premium
+                                        colors <span class="muted">(2000)</span></label>
+                                    <label class="switch" class="label-margin0">
+                                        <input id="autoBuyNeededColors" name="autoBuyNeededColors" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                            </div>
+                            <small class="help">If enabled, the bot balances premium color ownership across assigned
+                                accounts: buys needed premium colors for accounts with fewer premium colors first, if
+                                they have enough droplets. Works only when the template uses premium colors.</small>
+                        </div>
+
+                        <div class="form-actions">
+                            <button type="submit" id="submitTemplate" class="primary-button">
+                                <img src="icons/addTemplate.svg" alt="" /> Add Template
+                            </button>
+                        </div>
+                    </form>
+                </section>
+
+                <!-- ====== MANAGE TEMPLATES ====== -->
+                <section id="manageTemplates" style="display:none;">
+                    <header class="section-head">
+                        <h2>Manage Templates</h2>
+                        <div class="section-actions">
+                            <button id="startAll" class="primary-button">
+                                <img src="icons/playAll.svg" alt="" /> Start All
+                            </button>
+                            <button id="stopAll" class="secondary-button">
+                                <img src="icons/pauseAll.svg" alt="" /> Stop All
+                            </button>
+                            <button onclick="changeTab(main);" class="ghost-btn">
+                                <img src="icons/return.svg" alt="" /> Return
+                            </button>
+                        </div>
+                    </header>
+
+                    <div id="templateList" class="template-list"></div>
+                </section>
+
+                <!-- ====== COLORS ====== -->
+                <section id="colorsManager" style="display:none;">
+                    <header class="section-head">
+                        <h2>Colors</h2>
+                        <div class="section-actions">
+                            <button id="checkColorsAll" class="secondary-button">
+                                <img src="icons/check.svg" alt="" />
+                                Check Colors (All)
+                            </button>
+                            <button id="loadColorsCache" class="secondary-button">
+                                Load Last Check
+                            </button>
+                            <button onclick="changeTab(main);" class="ghost-btn">
+                                <img src="icons/return.svg" alt="" /> Return
+                            </button>
+                        </div>
+                    </header>
+
+                    <div class="summary" style="margin-bottom:8px">
+                        <span><b>Last Check:</b> <span id="colorsLastCheckLabel">–</span></span>
+                    </div>
+
+                    <!-- Palette of all colors -->
+                    <div class="settings-card">
+                        <div class="settings-card-head">
+                            <h3 class="settings-card-title">Palette</h3>
+                            <p class="settings-card-sub settings-card-sub-text2">Click a color to see who has it and buy
+                                for others (premium
+                                only). The cost of one premium color is 2,000 droplets.</p>
+                        </div>
+                        <div id="paletteAllColors" class="palette-grid"></div>
+                    </div>
+
+                    <!-- Selected color details -->
+                    <div id="colorDetailsCard" class="settings-card" style="display:none;">
+                        <div class="settings-card-info">
+                            <div class="colors-card-head">
+                                <span id="selectedColorSwatch" class="swatch large"
+                                    style="vertical-align:middle;">#–</span>
+                                <div class="settings-card-title-info-right">
+                                    <span class="settings-card-title" id="selectedColorTitle">Color details</span>
+                                    <span id="selectedColorKind" class="settings-card-sub">–</span>
+                                </div>
+                            </div>
+                            <div class="color-compact">
+                                <span id="selectedColorId" style="display:none">–</span>
+                            </div>
+                        </div>
+                        <p class="settings-card-sub settings-card-sub-text2">Premium colors are IDs 32–63. Basic colors
+                            are available for
+                            everyone.</p>
+
+                        <div class="grid-2">
+                            <div>
+                                <label class="label-margin0">Users who already have this color</label>
+                                <div id="usersHaveColor" class="chips" style="margin-top:6px;"></div>
+                            </div>
+                            <div>
+                                <label class="label-margin0">Users who don't have this color</label>
+                                <div class="inline-actions" style="margin-top:6px; margin-bottom:6px;">
+                                    <button type="button" id="selectAllNoColor" class="ghost-btn small"><img
+                                            src="icons/manageUsers.svg" alt=""> Select All</button>
+                                    <button type="button" id="UnselectAllNoColor" class="ghost-btn small"><img
+                                            src="icons/manageUsers.svg" alt=""> Unselect All</button>
+                                </div>
+                                <div id="usersNoColor" class="user-select-list"></div>
+                                <div class="form-actions" style="margin-top:8px;">
+                                    <button type="button" id="purchaseColorBtn" class="primary-button">
+                                        Attempt to Buy for Selected
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="purchaseReport" class="summary" style="margin-top:8px; display:none;"></div>
+                    </div>
+                </section>
+
+                <!-- ====== FLAGS ====== -->
+                <section id="flagsManager" style="display:none;">
+                    <header class="section-head">
+                        <h2>Flags</h2>
+                        <div class="section-actions">
+                            <button id="checkFlagsAll" class="secondary-button">
+                                <img src="icons/check.svg" alt="" />
+                                Check Flags (All)
+                            </button>
+                            <button id="loadFlagsCache" class="secondary-button">
+                                Load Last Check
+                            </button>
+                            <button onclick="changeTab(main);" class="ghost-btn">
+                                <img src="icons/return.svg" alt="" /> Return
+                            </button>
+                        </div>
+                    </header>
+
+                    <div class="summary" style="margin-bottom:8px">
+                        <span><b>Last Check:</b> <span id="flagsLastCheckLabel">–</span></span>
+                    </div>
+
+                    <div class="settings-card">
+                        <div class="settings-card-head">
+                            <h3 class="settings-card-title">Flags Catalog</h3>
+                            <p class="settings-card-sub settings-card-sub-text2">Display country’s flag next to
+                                username. Plus, when painting in regions where user own the corresponding flag, user
+                                recover 10% of the charges spent. The cost of one flag is 20,000 droplets.</p>
+                        </div>
+                        <div id="flagsAllList" class="palette-grid"></div>
+                    </div>
+
+                    <div id="flagDetailsCard" class="settings-card" style="display:none;">
+                        <div class="settings-card-info">
+                            <div class="colors-card-head">
+                                <span id="selectedFlagEmoji" class="swatch large flags-detail-emoji"
+                                    style="font-size:28px;line-height:28px;width:auto;min-width:40px;">🏳️</span>
+                                <div>
+                                    <h3 class="settings-card-title" id="selectedFlagTitle">–</h3>
+                                    <p class="settings-card-sub"><span id="selectedFlagId">–</span></p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="grid-2">
+                            <div>
+                                <label class="label-margin0">Users who already have this flag</label>
+                                <div id="haveFlagBulkSelectWrap" class="inline-actions"
+                                    style="margin-top:6px; margin-bottom:6px;">
+                                    <button type="button" id="selectAllHaveFlag" class="ghost-btn small"><img
+                                            src="icons/manageUsers.svg" alt=""> Select All</button>
+                                    <button type="button" id="unselectAllHaveFlag" class="ghost-btn small"><img
+                                            src="icons/manageUsers.svg" alt=""> Unselect All</button>
+                                </div>
+                                <div id="usersHaveFlag" class="user-select-list"></div>
+                                <div id="haveFlagActionsWrap" class="form-actions">
+                                    <button type="button" id="equipFlagBatchBtn" class="secondary-button"
+                                        style="display: inline-flex;">Equip
+                                    </button>
+                                    <button type="button" id="unequipFlagBatchBtn" class="secondary-button"
+                                        style="display: inline-flex;">Unequip
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="label-margin0">Users who don't have this flag</label>
+                                <div class="inline-actions" style="margin-top:6px; margin-bottom:6px;">
+                                    <button type="button" id="selectAllNoFlag" class="ghost-btn small"><img
+                                            src="icons/manageUsers.svg" alt=""> Select All</button>
+                                    <button type="button" id="UnselectAllNoFlag" class="ghost-btn small"><img
+                                            src="icons/manageUsers.svg" alt=""> Unselect All</button>
+                                </div>
+                                <div id="usersNoFlag" class="user-select-list"></div>
+                                <div class="form-actions" style="margin-top:8px; gap:8px; flex-wrap: wrap;">
+                                    <button type="button" id="purchaseFlagBtn" class="primary-button"
+                                        style="display: inline-flex;">
+                                        Attempt to Buy for Selected
+                                    </button>
+                                </div>
+                                <div id="purchaseFlagReport" class="summary" style="margin-top:8px; display:none;">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ====== LOGS (LIVE) ====== -->
+                <section id="liveLogs" style="display:none;">
+                    <header class="section-head">
+                        <h2>Live Logs</h2>
+                        <div class="section-actions">
+                            <button onclick="changeTab(main);" class="ghost-btn">
+                                <img src="icons/return.svg" alt="" /> Return
+                            </button>
+                            <button id="toggleMaskLogs" class="secondary-button">Hide Sensitive Info</button>
+                            <button id="clearLogs" class="secondary-button">Clear</button>
+                        </div>
+                    </header>
+
+                    <div class="settings-card" style="max-height:500px; overflow:auto; background-color: #15161a;">
+                        <pre id="logsOutput" class="logs-output"
+                            style="white-space:pre-wrap; word-break:break-word; margin:0;"></pre>
+                    </div>
+
+                    <div class="settings-card">
+                        <div class="settings-card-head">
+                            <h3 class="settings-card-title">Logs</h3>
+                            <p class="settings-card-sub">Toggle categories printed to terminal in real time.</p>
+                        </div>
+
+                        <div class="toggles">
+                            <div>
+                                <div class="setting-toggle">
+                                    <label for="log_maskPii" class="label-margin0">Mask names and IDs</label>
+                                    <label class="switch">
+                                        <input id="log_maskPii" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <small class="help">Replace (nick#id), #12345 and tile coordinates with masked values.
+                                    Applies to NEW logs only.</small>
+                            </div>
+                            <div>
+                                <div class="setting-toggle">
+                                    <label for="log_tokenManager" class="label-margin0">TOKEN_MANAGER</label>
+                                    <label class="switch">
+                                        <input id="log_tokenManager" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <small class="help">Notifications about token queue, receipt and
+                                    invalidation.</small>
+                            </div>
+                            <div>
+                                <div class="setting-toggle">
+                                    <label for="log_cache" class="label-margin0">Cache updates</label>
+                                    <label class="switch">
+                                        <input id="log_cache" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <small class="help">Internal cache refresh logs (charges, tiles, etc.).</small>
+                            </div>
+                            <div>
+                                <div class="setting-toggle">
+                                    <label for="log_queuePreview" class="label-margin0">Queue preview</label>
+                                    <label class="switch">
+                                        <input id="log_queuePreview" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <small class="help">High-level plan for next paint (queues/segments).</small>
+                            </div>
+                            <div>
+                                <div class="setting-toggle">
+                                    <label for="log_painting" class="label-margin0">Painting method</label>
+                                    <label class="switch">
+                                        <input id="log_painting" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <small class="help">Which drawing strategy is used this turn.</small>
+                            </div>
+                            <div>
+                                <div class="setting-toggle">
+                                    <label for="log_startTurn" class="label-margin0">Start turn (predictions)</label>
+                                    <label class="switch">
+                                        <input id="log_startTurn" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <small class="help">Messages like “Start turn with predicted ...”.</small>
+                            </div>
+                            <div>
+                                <div class="setting-toggle">
+                                    <label for="log_mismatches" class="label-margin0">Mismatched pixels</label>
+                                    <label class="switch">
+                                        <input id="log_mismatches" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <small class="help">Findings like “Found .. mismatched ..”.</small>
+                            </div>
+                            <div>
+                                <div class="setting-toggle">
+                                    <label for="log_estimatedTime" class="label-margin0">Estimated time</label>
+                                    <label class="switch">
+                                        <input id="log_estimatedTime" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <small class="help">Show estimated time left on log.</small>
+                            </div>
+                        </div>
+                    </div>
+
+                </section>
+
+                <!-- ====== QUEUE PREVIEW ====== -->
+                <section id="queuePreview" style="display:none;">
+                    <header class="section-head">
+                        <h2>Queue Preview</h2>
+                        <div class="section-actions">
+                            <button id="refreshQueuePreview" class="secondary-button">
+                                <img src="icons/refresh.svg" alt="" />
+                                Refresh Queue
+                            </button>
+                            <button onclick="changeTab(main);" class="ghost-btn">
+                                <img src="icons/return.svg" alt="" />
+                                Return
+                            </button>
+                        </div>
+                    </header>
+                    
+                    <div class="settings-card">
+                        <div class="settings-card-head">
+                            <h3 class="settings-card-title">User Queue</h3>
+                            <p class="settings-card-sub">List of users and predicted charges</p>
+                        </div>
+
+                        <div class="summary" style="margin-top:10px">
+                            <div class="summary-line">
+                                <span><b>Total Users:</b> <span id="queueTotalUsers">0</span></span>
+                                <span><b>Ready to Paint:</b> <span id="queueReadyUsers">0</span></span>
+                                <span><b>Charge Threshold:</b> <span id="queueChargeThreshold">0</span>%</span>
+                                <span><b>Total Charges:</b> <span id="queueTotalCharges">0</span>/<span id="queueTotalMaxCharges">0</span></span>
+                            </div>
+                        </div>
+                        <div id="queueUserList" class="queue-user-list">
+                            <div class="queue-loading">Loading queue data...</div>
+                        </div>
+                        <div class="summary" style="margin-bottom:8px">
+                            <div class="summary-line">
+                                <span><b>Last Update:</b> <span id="queueLastUpdate">–</span></span>
+                            </div>
+                            <div class="queue-controls">
+                                <div class="setting-toggle">
+                                    <label for="hideSensitiveInfoQueue" class="label-margin0">Hide sensitive info</label>
+                                    <label class="switch">
+                                        <input id="hideSensitiveInfoQueue" name="hideSensitiveInfoQueue" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="setting-toggle">
+                                <div class="auto-refresh-group" id="autoRefreshGroup">
+                                    <label for="autoRefreshQueue" class="label-margin0">Auto refresh</label>
+                                    <input id="queueRefreshInterval" type="number" min="1" max="300" value="5"
+                                        class="interval-input" style="display: none;" />
+                                    <span class="interval-label" id="intervalLabel"
+                                        style="display: none;">(seconds)</span>
+                                </div>
+                                <label class="switch">
+                                    <input id="autoRefreshQueue" name="autoRefreshQueue" type="checkbox" checked />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    
+                </section>
+
+                <!-- ====== GRIEF MONITORING ====== -->
+                <section id="griefers" style="display:none;">
+                    <header class="section-head">
+                        <h2>Grief Monitoring</h2>
+                        <div class="section-actions">
+                            <button id="clearGriefersBtn" class="ghost-btn" style="margin-right: 10px;">
+                                <img src="icons/remove.svg" alt="" />
+                                Clear All
+                            </button>
+                            <button id="refreshGriefersBtn" class="ghost-btn">
+                                <img src="icons/refresh.svg" alt="" />
+                                Refresh
+                            </button>
+                            <button id="exportGriefersBtn" class="ghost-btn">
+                                <img src="icons/export.svg" alt="" />
+                                Export CSV
+                            </button>
+                            <button onclick="changeTab(main);" class="ghost-btn">
+                                <img src="icons/return.svg" alt="" />
+                                <span class="hide-sm">Return</span>
+                            </button>
+                        </div>
+                    </header>
+                    
+                    <div class="settings-card">
+                        <div class="settings-card-head">
+                            <h3 class="settings-card-title">Grief Monitoring</h3>
+                            <p class="settings-card-sub">Automatically detect and track griefers</p>
+                        </div>
+
+                        <div class="summary" style="margin-top:10px">
+                            <div class="summary-line">
+                                <span><b>Total Griefers:</b> <span id="griefersTotalCount">0</span></span>
+                                <span><b>Status:</b> <span id="griefersMonitoringStatus">Disabled</span></span>
+                                <span><b>Last Detection:</b> <span id="griefersLastDetection">–</span></span>
+                            </div>
+                        </div>
+                        
+                        <div class="griefers-controls" style="margin: 10px 0;">
+                            <div class="setting-toggle" style="margin-bottom: 10px;">
+                                <label for="griefMonitoringToggle" class="label-margin0">Enable Monitoring</label>
+                                <label class="switch">
+                                    <input id="griefMonitoringToggle" type="checkbox" />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div id="griefersTable" class="griefers-table">
+                            <div class="griefers-loading">Loading griefers data...</div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ====== SETTINGS ====== -->
+                <section id="settings" style="display:none;">
+                    <header class="section-head">
+                        <h2>Settings</h2>
+                        <div class="section-actions">
+                            <button onclick="changeTab(main);" class="ghost-btn">
+                                <img src="icons/return.svg" alt="" /> Return
+                            </button>
+                        </div>
+                    </header>
+
+                    <!-- only the form (top) -->
+                    <form class="settings-form" autocomplete="off">
+                        <!-- Drawing -->
+                        <!-- kept for compatibility, but hidden (we no longer use select) -->
+                        <div style="display:none;">
+                            <label for="drawingModeSelect">Drawing Mode (hidden)</label>
+                            <select id="drawingModeSelect" aria-hidden="true">
+                                <option value="linear">Top to Bottom</option>
+                            </select>
+                        </div>
+                        <!-- previews -->
+                        <div class="settings-preview-card settings-preview-compact settings-card">
+                            <div class="settings-preview-head">
+                                <h3 class="settings-card-title">Drawing mode</h3>
+                                <p class="settings-card-sub">Click the preview card to select a drawing method.</p>
+                            </div>
+
+                            <div id="modeGuide" class="mode-guide">
+                                <div class="mode-card preview-mode">
+                                    <div class="mode-card-head">
+                                        <span class="mode-title">Reference image</span>
+                                        <span class="mode-badge">Base image for all previews</span>
+                                    </div>
+                                    <canvas id="modeReference" class="mode-preview" width="220" height="120"></canvas>
+
+                                    <div id="presetSwitcher" class="preset-switcher" aria-label="Preview presets"></div>
+
+                                    <div class="inline-field range-wrap" style="margin-top:8px">
+                                        <label for="previewSpeed" class="label-margin0">
+                                            Preview speed: <span id="previewSpeedLabel">1×</span>
+                                        </label>
+                                        <input type="range" id="previewSpeed" min="0.25" max="3" step="0.25"
+                                            value="1" />
+                                    </div>
+
+                                    <p class="mode-desc">This is the image that modes will "repaint" below.</p>
+                                </div>
+
+                                <div class="mode-cards-grid">
+                                    <div class="mode-card" data-mode="linear">
+                                        <canvas class="mode-preview" data-mode="linear" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">1. Top to Bottom</span>
+                                            <span class="mode-badge">Row by row</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="linear-reversed">
+                                        <canvas class="mode-preview" data-mode="linear-reversed" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">2. Bottom to Top</span>
+                                            <span class="mode-badge">Row by row</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="linear-skip1">
+                                        <canvas class="mode-preview" data-mode="linear-skip1" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">2b. Top to Bottom (Skip 1)</span>
+                                            <span class="mode-badge">Checkerboard parity</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="linear-ltr">
+                                        <canvas class="mode-preview" data-mode="linear-ltr" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">3. Left to Right</span>
+                                            <span class="mode-badge">Column by column</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="linear-ltr-skip1">
+                                        <canvas class="mode-preview" data-mode="linear-ltr-skip1" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">3b. Left to Right (Skip 1)</span>
+                                            <span class="mode-badge">Checkerboard parity</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="linear-rtl">
+                                        <canvas class="mode-preview" data-mode="linear-rtl" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">4. Right to Left</span>
+                                            <span class="mode-badge">Column by column</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="singleColorRandom">
+                                        <canvas class="mode-preview" data-mode="singleColorRandom" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">5. Random Colors</span>
+                                            <span class="mode-badge">Random order of colors</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="colorByColor">
+                                        <canvas class="mode-preview" data-mode="colorByColor" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">6. By Color</span>
+                                            <span class="mode-badge">Group by color</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="random">
+                                        <canvas class="mode-preview" data-mode="random" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">7. Random</span>
+                                            <span class="mode-badge">Random scatter</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="radial-inward">
+                                        <canvas class="mode-preview" data-mode="radial-inward" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">8. Outside In</span>
+                                            <span class="mode-badge">Edges to center</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="radial-outward">
+                                        <canvas class="mode-preview" data-mode="radial-outward" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">9. Inside Out</span>
+                                            <span class="mode-badge">Center to edges</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="burst">
+                                        <canvas class="mode-preview" data-mode="burst" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">10. Bursts</span>
+                                            <span class="mode-badge">Multiple start points</span>
+                                        </div>
+
+                                        <!-- seed count moved to burst card -->
+                                        <div class="seed-input">
+                                            <label for="seedCount" class="mode-title seed-field-title">Seeds</label>
+                                            <input id="seedCount" type="number" min="1" max="16" value="2"
+                                                class="seed-input-field" />
+                                            <small class="muted">Burst seed count (1–16)</small>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="colors-burst-rare">
+                                        <canvas class="mode-preview" data-mode="colors-burst-rare" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">11. Rare Colors First</span>
+                                            <span class="mode-badge">Colors by rarity</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="outline-then-burst">
+                                        <canvas class="mode-preview" data-mode="outline-then-burst" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">12. Outline then Fill</span>
+                                            <span class="mode-badge">Outline first</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="burst-mixed">
+                                        <canvas class="mode-preview" data-mode="burst-mixed" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">13. Mixed (3 modes)</span>
+                                            <span class="mode-badge">Random (10, 11, 12)</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="mode-card" data-mode="linear-skip1-fill">
+                                        <canvas class="mode-preview" data-mode="linear-skip1-fill" width="220"
+                                            height="120"></canvas>
+                                        <div class="mode-card-head">
+                                            <span class="mode-title">14. Top to Bottom (Skip 1 → Fill)</span>
+                                            <span class="mode-badge">Fill remaining after skip</span>
+                                        </div>
+                                    </div>
+
+
+                                </div>
+                            </div>
+                        </div>
+
+
+                        <!-- Behaviour -->
+                        <div class="settings-card">
+                            <div class="settings-card-head">
+                                <h3 class="settings-card-title">Behaviour</h3>
+                                <p class="settings-card-sub">Notifications and automatic actions.</p>
+                            </div>
+
+                            <div class="field">
+                                <div class="setting-toggle">
+                                    <label for="turnstileNotifications" class="label-margin0">Enable desktop
+                                        notifications for Turnstile</label>
+                                    <label class="switch" class="label-margin0">
+                                        <input id="turnstileNotifications" name="turnstileNotifications"
+                                            type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div>
+                                <div class="field">
+                                    <div class="setting-toggle">
+                                        <label for="alwaysDrawOnCharge" class="label-margin0">Always draw when at least
+                                            one charge is available</label>
+                                        <label class="switch" class="label-margin0">
+                                            <input id="alwaysDrawOnCharge" name="alwaysDrawOnCharge" type="checkbox" />
+                                            <span class="slider"></span>
+                                        </label>
+                                    </div>
+                                    <small class="help">If enabled — lower threshold is ignored.</small>
+                                </div>
+
+                                <div class="field" id="chargeThresholdContainer">
+                                    <label for="chargeThreshold">Charge Threshold</label>
+                                    <div class="input-affix">
+                                        <input type="number" id="chargeThreshold" min="1" max="100" value="50" />
+                                        <span class="suffix">%</span>
+                                    </div>
+                                    <small class="help">Start drawing when the charge threshold is reached.</small>
+                                </div>
+                            </div>
+
+                            <div>
+                                <div class="field">
+                                    <label for="maxPixelsPerPass">Max pixels per pass</label>
+                                    <div class="input-affix">
+                                        <input type="number" id="maxPixelsPerPass" min="0" value="0" />
+                                        <span class="suffix">px</span>
+                                    </div>
+                                    <small class="help">0 = no limit. If > 0, limits how many pixels a user paints per
+                                        run.</small>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Cooldowns & limits -->
+                        <div class="settings-card">
+                            <div class="settings-card-head">
+                                <h3 class="settings-card-title">Cooldowns & Limits</h3>
+                                <p class="settings-card-sub">Timings and operation limits.</p>
+                            </div>
+
+                            <div class="grid-2">
+                                <div class="field">
+                                    <label for="accountCooldown">Account Turn Cooldown</label>
+                                    <div class="input-affix">
+                                        <input type="number" id="accountCooldown" min="0" value="20" />
+                                        <span class="suffix">sec</span>
+                                    </div>
+                                </div>
+
+                                <div class="field">
+                                    <label for="purchaseCooldown">Purchase Cooldown</label>
+                                    <div class="input-affix">
+                                        <input type="number" id="purchaseCooldown" min="0" value="5" />
+                                        <span class="suffix">sec</span>
+                                    </div>
+                                </div>
+
+                                <div class="field">
+                                    <label for="accountCheckCooldown">Account Check Cooldown</label>
+                                    <div class="input-affix">
+                                        <input type="number" id="accountCheckCooldown" min="0" value="0" />
+                                        <span class="suffix">sec</span>
+                                    </div>
+                                </div>
+
+                                <div class="field">
+                                    <label for="dropletReserve">Droplets Reserve After Buying</label>
+                                    <div class="input-affix">
+                                        <input type="number" id="dropletReserve" min="0" value="0" />
+                                        <span class="suffix">drops</span>
+                                    </div>
+                                </div>
+
+                                <div class="field">
+                                    <label for="antiGriefStandby">Anti-Grief Standby Time</label>
+                                    <div class="input-affix">
+                                        <input type="number" id="antiGriefStandby" min="1" value="10" />
+                                        <span class="suffix">min</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Proxy -->
+                        <div class="settings-card">
+                            <div class="settings-card-head">
+                                <h3 class="settings-card-title">Proxy</h3>
+                                <p class="settings-card-sub">Rotation of HTTP(S)/SOCKS proxies for bot requests
+                                    (controlled on the backend).</p>
+                            </div>
+
+                            <div class="setting-toggle">
+                                <label for="proxyEnabled" class="label-margin0">Enable proxy</label>
+                                <label class="switch">
+                                    <input id="proxyEnabled" name="proxyEnabled" type="checkbox" />
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div id="proxyFormContainer" style="display:none; margin-top:8px">
+                                <div class="field">
+                                    <label for="proxyRotationMode">Rotation mode</label>
+                                    <select id="proxyRotationMode">
+                                        <option value="sequential">Sequential</option>
+                                        <option value="random">Random</option>
+                                    </select>
+
+                                    <small class="help">
+                                        Proxies are loaded from the <code>proxies.txt</code> file in your
+                                        <code>/data</code> folder. Add one proxy per line in the format
+                                        <code>protocol://user:pass@host:port</code>. You can get high quality proxies at
+                                        <a href="https://dataimpulse.com/?aff=199328" target="_blank"
+                                            rel="noopener noreferrer">DataImpulse</a>.
+                                    </small>
+
+                                </div>
+
+                                <div class="setting-toggle">
+                                    <label for="logProxyUsage" class="label-margin0">Log proxy connections</label>
+                                    <label class="switch">
+                                        <input id="logProxyUsage" name="logProxyUsage" type="checkbox" />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+
+                                <div class="summary" style="margin-top:8px">
+                                    <span><b>Proxies loaded:</b> <span id="proxyCount">0</span></span>
+                                </div>
+
+                                <button type="button" id="reloadProxiesBtn" class="secondary-button"
+                                    style="margin-top:8px">
+                                    Reload proxies.txt
+                                </button>
+                                <button type="button" id="testProxiesBtn" class="secondary-button"
+                                    style="margin-top:8px">
+                                    Test proxies
+                                </button>
+                                <div id="testProxiesProgress" class="summary" style="margin-top:6px; display:none;">
+                                </div>
+                                <div id="testProxiesResult" class="summary" style="margin-top:8px; display:none;"></div>
+                                <div id="cleanupBlockedWrap" style="margin-top:8px; display:none;">
+                                    <button type="button" id="cleanupBlockedBtn" class="destructive-button">Remove
+                                        BLOCKED proxies (backup will be created)</button>
+                                </div>
+                                <div class="field" style="margin-top:8px">
+                                    <label for="parallelWorkers">Concurrent workers (with proxy)</label>
+                                    <div class="input-affix">
+                                        <input type="number" id="parallelWorkers" min="1" max="32" value="4" />
+                                        <span class="suffix">workers</span>
+                                    </div>
+                                    <small class="help">Max number of parallel accounts when proxies are enabled (except
+                                        drawing).</small>
+                                </div>
+                            </div>
+                        </div>
+
+
+
+
+
+                    </form>
+
+                </section>
+
+            </div>
+
+            <section class="footer-container">
+                <div class="footer-box">
+                    <p class="credits">
+                        Made by <a href="https://github.com/luluwaffless">luluwaffless <img src="icons/github.svg"></a>
+                        and <a href="https://github.com/JinxTheCatto">Jinx <img src="icons/github.svg"></a> | Forked
+                        by <a href="https://github.com/lllexxa">lllexxa <img src="icons/github.svg"></a>
+                    </p>
+                    <p class="credits"><a href="https://github.com/lllexxa/wplacer">Github repository <img
+                                src="icons/github.svg"></a>
+                    </p>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Floating home button -->
+    <div class="sticky-button">
+        <button onclick="changeTab(main);" class="sticky-button-btn" title="Back to Dashboard">
+            <img src="icons/return.svg" alt="" />
+        </button>
+    </div>
+
+    <!-- Dialog -->
+    <div id="messageBoxOverlay" class="hidden" role="dialog" aria-modal="true">
+        <div id="messageBox">
+            <h3 id="messageBoxTitle"></h3>
+            <p id="messageBoxContent"></p>
+            <div class="message-box-buttons">
+                <button id="messageBoxConfirm" class="primary-button">OK</button>
+                <button id="messageBoxCancel" class="secondary-button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="messageBoxOverlayBig" class="hidden" role="dialog" aria-modal="true">
+        <div id="messageBoxBig">
+            <h3 id="messageBoxTitleBig"></h3>
+            <p id="messageBoxContentBig"></p>
+            <div class="message-box-buttons">
+                <button id="messageBoxConfirmBig" class="primary-button">OK</button>
+                <button id="messageBoxCancelBig" class="secondary-button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Active templates bar -->
+    <div id="activeTemplatesBar" class="active-bar hidden">
+        <div class="active-bar-inner" id="activeTemplatesBarContent"></div>
+    </div>
+
+    <script src="scripts/index.js" type="text/javascript"></script>
+</body>
+
+</html>
