@@ -9,7 +9,7 @@ import cors from "cors";
 import { CookieJar } from "tough-cookie";
 import { Impit } from "impit";
 import { Image, createCanvas, loadImage } from "canvas";
-import { initPawtect, setUserId, requestUrl, getPawtectedEndpointPayload } from './pawtect/pawtect.js';_
+import { initPawtect, setUserId, requestUrl, getPawtectedEndpointPayload } from './pawtect/pawtect.js';
 import { PNG } from "pngjs";
 import crypto from "crypto";
 
@@ -5331,4 +5331,5 @@ app.get('/export-tokens', (req, res) => {
     process.on('SIGTERM', shutdown);
   } catch (_) { }
 })();
+
 
