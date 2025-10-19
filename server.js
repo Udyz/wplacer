@@ -116,7 +116,7 @@ function backendTilePixelToLatLng_center(tileX, tileY, pixelX, pixelY, opts = {}
 async function fetchTile(tileX, tileY) {
   try {
     const browser = new Impit({ browser: "chrome", ignoreTlsErrors: true });
-    const url = `https://backend.wplace.live/files/s0/tiles/${tileX}/${tileY}.png?t=${Date.now()}`;
+    const url = `https://backend.wplace.live/files/s0/tiles/${tileX}/${tileY}.png`;
     const response = await browser.fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -956,7 +956,7 @@ class WPlacer {
 
     const loadOneTile = async (targetTx, targetTy, allowActivate = true) => {
       try {
-        const url = `https://backend.wplace.live/files/s0/tiles/${targetTx}/${targetTy}.png?t=${Date.now()}`;
+        const url = `https://backend.wplace.live/files/s0/tiles/${targetTx}/${targetTy}.png`;
         const resp = await fetch(url, { headers: { Accept: "image/*" } });
         if (resp.status === 404) {
           // Tile might be not initialized yet
@@ -5333,4 +5333,5 @@ app.get('/export-tokens', (req, res) => {
     process.on('SIGTERM', shutdown);
   } catch (_) { }
 })();
+
 
