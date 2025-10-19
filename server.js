@@ -913,6 +913,8 @@ class WPlacer {
       "Sec-Fetch-Mode": "cors",
       "Sec-Fetch-Site": "same-site"
     };
+    if (this.pawtect) { headers['x-pawtect-token'] = this.pawtect; }
+    if (this.pawtectVariant) { headers['x-pawtect-variant'] = this.pawtectVariant; }
     const request = await this.browser.fetch(url, {
       method: "POST",
       headers,
@@ -5331,5 +5333,4 @@ app.get('/export-tokens', (req, res) => {
     process.on('SIGTERM', shutdown);
   } catch (_) { }
 })();
-
 
