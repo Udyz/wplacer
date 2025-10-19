@@ -9,8 +9,9 @@ import cors from "cors";
 import { CookieJar } from "tough-cookie";
 import { Impit } from "impit";
 import { Image, createCanvas, loadImage } from "canvas";
-import { initPawtect, setUserId, requestUrl, getPawtectedEndpointPayload } from './pawtect/pawtect.js';
+import { initPawtect, setUserId, requestUrl, getPawtectedEndpointPayload } from './pawtect/pawtect.js';_
 import { PNG } from "pngjs";
+import crypto from "crypto";
 
 // --- Setup __dirname for ES modules ---
 const __filename = fileURLToPath(import.meta.url);
@@ -115,7 +116,7 @@ function backendTilePixelToLatLng_center(tileX, tileY, pixelX, pixelY, opts = {}
 async function fetchTile(tileX, tileY) {
   try {
     const browser = new Impit({ browser: "chrome", ignoreTlsErrors: true });
-    const url = `https://bplace.org/files/s0/tiles/${tileX}/${tileY}.png?t=${Date.now()}`;
+    const url = `https://backend.wplace.live/files/s0/tiles/${tileX}/${tileY}.png?t=${Date.now()}`;
     const response = await browser.fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -158,7 +159,7 @@ function parseTileData(buffer) {
 async function fetchUser(tileX, tileY, pixelX, pixelY) {
   const browser = new Impit({ browser: "chrome", ignoreTlsErrors: true });
   let retry = 0;
-  const url = `https://bplace.org/s0/pixel/${tileX}/${tileY}?x=${pixelX}&y=${pixelY}`;
+  const url = `https://backend.wplace.live/s0/pixel/${tileX}/${tileY}?x=${pixelX}&y=${pixelY}`;
   try {
     const headers = {
       "accept": "*/*",
@@ -170,7 +171,7 @@ async function fetchUser(tileX, tileY, pixelX, pixelY) {
       "sec-fetch-dest": "empty",
       "sec-fetch-mode": "cors",
       "sec-fetch-site": "same-site",
-      "Referer": "https://bplace.org/"
+      "Referer": "https://backend.wplace.live/"
     };
     
     const response = await browser.fetch(url, { headers });
@@ -331,7 +332,7 @@ async function checkGriefersInTemplate(templateId, templateData, sampleLimit = 1
           name: user.name,
           id: user.id,
           alliance: user.allianceName || '-',
-          url: `https://bplace.org/?lat=${lat}&lng=${lon}&zoom=${zoom}`,
+          url: `https://backend.wplace.live/?lat=${lat}&lng=${lon}&zoom=${zoom}`,
           lat: lat,
           lng: lon, // Keep lng for frontend compatibility
           griefType: mismatch.griefType,
@@ -798,10 +799,9 @@ class WPlacer {
   async login(cookies) {
     this.cookies = cookies;
     const jar = new CookieJar();
-    // jar.setCookieSync("cf_clearance=Z5sMXVChXiI5It4vOc4u_czRijQ4QwKdO3NRcIhrHmY-1758997225-1.2.1.1-rvYYMJExMZ_Sk0EEbWwkE7l2ceMacSN0w_K.DslhK.BxSOQ8f2GujfyA.h769eDKZdDQNislZKbmzBWumGVKi9ChjWAPyRXwOgfZScEBsn1WA87lzc8FsxSpbBKhz_UWLQi6jbXaEYUm0RnLEtGqpEPEUw6R46hu7OYavuNktWTcnoONTin9kXPGv_TU.H6vmDJWQQp3PdWYBr2U3IIbcXbPp3WIqHUCXUp5rowTJIk; Path=/; Secure; SameSite=Lax", "https://bplace.org")
     for (const cookie of Object.keys(this.cookies)) {
       const value = `${cookie}=${this.cookies[cookie]}; Path=/`;
-      jar.setCookieSync(value, "https://bplace.org");
+      jar.setCookieSync(value, "https://backend.wplace.live");
     }
     const impitOptions = { cookieJar: jar, browser: "chrome", ignoreTlsErrors: true };
     const proxySel = getNextProxy();
@@ -820,13 +820,13 @@ class WPlacer {
   }
 
   async loadUserInfo() {
-    const url = "https://bplace.org/me";
+    const url = "https://backend.wplace.live/me";
     const me = await this.browser.fetch(url, {
       headers: {
         "Accept": "application/json, text/plain, */*",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://bplace.org/",
-        "Origin": "https://bplace.org",
+        "Referer": "https://backend.wplace.live/",
+        "Origin": "https://backend.wplace.live",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
         "Sec-Fetch-Dest": "empty",
@@ -905,9 +905,9 @@ class WPlacer {
     const headers = {
       Accept: "application/json, text/plain, */*",
       "Content-Type": "text/plain;charset=UTF-8",
-      Referer: "https://bplace.org/",
-      Origin: "https://bplace.org",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      Referer: "https://backend.wplace.live/",
+      Origin: "https://backend.wplace.live",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", //replace user-agent with your browser user-agent that login to wplace
       "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
       "Sec-Fetch-Dest": "empty",
       "Sec-Fetch-Mode": "cors",
@@ -954,7 +954,7 @@ class WPlacer {
 
     const loadOneTile = async (targetTx, targetTy, allowActivate = true) => {
       try {
-        const url = `https://bplace.org/files/s0/tiles/${targetTx}/${targetTy}.png?t=${Date.now()}`;
+        const url = `https://backend.wplace.live/files/s0/tiles/${targetTx}/${targetTy}.png?t=${Date.now()}`;
         const resp = await fetch(url, { headers: { Accept: "image/*" } });
         if (resp.status === 404) {
           // Tile might be not initialized yet
@@ -1006,7 +1006,22 @@ class WPlacer {
     await Promise.all(promises);
     return true;
   }
+  async fp() {
+    if (this.userInfo?.id && users[this.userInfo.id]?.fp) {
+      return users[this.userInfo.id].fp;
+    }
+    
+    if (crypto.randomUUID) {
+      return crypto.randomUUID().replace(/-/g, "");
+    }
 
+    const e = () => crypto.randomBytes(1)[0];
+
+    return ("10000000100040008000" + 1e11).replace(
+      /[018]/g,
+      n => (n ^ (e() & 15) >> (n / 4)).toString(16)
+    );
+  }
   async _activateTileIfPossible(targetTx, targetTy) {
     try {
       const [startTileX, startTileY, startPx, startPy] = this.coords;
@@ -1024,8 +1039,8 @@ class WPlacer {
           if (tx !== targetTx || ty !== targetTy) continue;
           const localPx = globalPx % tileSize;
           const localPy = globalPy % tileSize;
-          const body = { colors: [templateColor], coords: [localPx, localPy], t: this.token };
-          if (globalThis.__wplacer_last_fp) body.fp = globalThis.__wplacer_last_fp;
+          const body = { colors: [templateColor], coords: [localPx, localPy]};
+          body.fp = await this.fp();
           const res = await this._executePaint(targetTx, targetTy, body);
           if (res && res.success && res.painted > 0) {
             try { log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] ℹ️ Tile ${targetTx},${targetTy} might be inactive. Tried to activate by painting 1 pixel.`); } catch (_) {}
@@ -1044,77 +1059,111 @@ class WPlacer {
   }
 
   async _executePaint(tx, ty, body) {
-    const url = `https://bplace.org/s0/pixel/${tx}/${ty}`;
+    const wasm = await getPawtectWasm();
+    const url = `https://backend.wplace.live/s0/pixel/${tx}/${ty}`;
+    setUserId(wasm, this.userInfo.id);
+    requestUrl(wasm, url);
+    const expMap = (this.userInfo && this.userInfo.experiments) ? this.userInfo.experiments : null;
+    const expObj = (() => {
+      try {
+        if (!expMap || Object.keys(expMap).length === 0) return null;
+        for (const [k, v] of Object.entries(expMap)) {
+          if (v && typeof v.variant === 'string' && /pawtect/i.test(String(k))) return v;
+        }
+        for (const v of Object.values(expMap)) {
+          if (v && typeof v.variant === 'string') return v;
+        }
+      } catch {}
+      return null;
+    })();
+    if (!expObj) {
+      this.pawtectVariant = "koala";
+      if (!this.pawtect) {
+        this.pawtect = await getPawtectedEndpointPayload(wasm, JSON.stringify(body));
+      }
+    } else {
+      this.pawtectVariant = String(expObj.variant || "disabled");
+      if (this.pawtectVariant === "disabled") {
+        this.pawtect = "";
+      } else {
+        if (!this.pawtect) {
+          this.pawtect = await getPawtectedEndpointPayload(wasm, JSON.stringify(body));
+        }
+      }
+    }
+    if (this.pawtect != "") {
+      log("SYSTEM", "wplacer", `🛡️ TOKEN_MANAGER: Pawtect token ${this.pawtect.substring(0, 20)}... [${this.pawtectVariant}|${!!expObj}]`);
+    }
     if (body.colors.length === 0) return { painted: 0, success: true };
     const response = await this.post(url, body);
 
     if (response.data.painted && response.data.painted === body.colors.length) {
       log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 🎨 Painted ${body.colors.length} pixels on tile ${tx}, ${ty}.`);
       
-      // Trigger grief check after painting (1 sample only)
-      if (currentSettings.griefMonitoringEnabled) {
-        const entry = Object.entries(templates).find(([tid, t]) => t && t.name === this.templateName && Array.isArray(t.coords) && JSON.stringify(t.coords) === JSON.stringify(this.coords));
-        const tpl = entry ? entry[1] : null;
-        const tplId = entry ? entry[0] : null;
-        if (tpl && tplId) {
-          // Check griefers asynchronously without blocking painting (1 sample only)
-          setImmediate(() => {
-            checkGriefersInTemplate(tplId, tpl, 1);
-          });
-        }
+    // Trigger grief check after painting (1 sample only)
+    if (currentSettings.griefMonitoringEnabled) {
+      const entry = Object.entries(templates).find(([tid, t]) => t && t.name === this.templateName && Array.isArray(t.coords) && JSON.stringify(t.coords) === JSON.stringify(this.coords));
+      const tpl = entry ? entry[1] : null;
+      const tplId = entry ? entry[0] : null;
+      if (tpl && tplId) {
+        // Check griefers asynchronously without blocking painting (1 sample only)
+        setImmediate(() => {
+          checkGriefersInTemplate(tplId, tpl, 1);
+        });
       }
+    }
       
-      try {
-        // Heatmap logging: write per-template records
-        const entry = Object.entries(templates).find(([tid, t]) => t && t.name === this.templateName && Array.isArray(t.coords) && JSON.stringify(t.coords) === JSON.stringify(this.coords));
-        const tpl = entry ? entry[1] : null;
-        const tplId = entry ? entry[0] : null;
-        if (tpl && tpl.heatmapEnabled) {
-          const [TlX, TlY, PxX0, PxY0] = this.coords;
-          const date = Date.now();
-          const coords = body.coords || [];
-          // records are pairs Px X, Px Y (convert to template-local coordinates)
-          const startGlobalX = (TlX * 1000) + (PxX0 | 0);
-          const startGlobalY = (TlY * 1000) + (PxY0 | 0);
-          const pairs = [];
-          for (let i = 0; i < coords.length; i += 2) {
-            const localPx = coords[i];
-            const localPy = coords[i + 1];
-            if (typeof localPx === 'number' && typeof localPy === 'number') {
-              const globalX = (tx * 1000) + localPx;
-              const globalY = (ty * 1000) + localPy;
-              const tplX = globalX - startGlobalX; // template-local X
-              const tplY = globalY - startGlobalY; // template-local Y
-              if (Number.isFinite(tplX) && Number.isFinite(tplY)) {
-                pairs.push({ date, "Tl X": TlX, "Tl Y": TlY, "Px X": tplX, "Px Y": tplY });
-              }
+    try {
+      // Heatmap logging: write per-template records
+      const entry = Object.entries(templates).find(([tid, t]) => t && t.name === this.templateName && Array.isArray(t.coords) && JSON.stringify(t.coords) === JSON.stringify(this.coords));
+      const tpl = entry ? entry[1] : null;
+      const tplId = entry ? entry[0] : null;
+      if (tpl && tpl.heatmapEnabled) {
+        const [TlX, TlY, PxX0, PxY0] = this.coords;
+        const date = Date.now();
+        const coords = body.coords || [];
+        // records are pairs Px X, Px Y (convert to template-local coordinates)
+        const startGlobalX = (TlX * 1000) + (PxX0 | 0);
+        const startGlobalY = (TlY * 1000) + (PxY0 | 0);
+        const pairs = [];
+        for (let i = 0; i < coords.length; i += 2) {
+          const localPx = coords[i];
+          const localPy = coords[i + 1];
+          if (typeof localPx === 'number' && typeof localPy === 'number') {
+            const globalX = (tx * 1000) + localPx;
+            const globalY = (ty * 1000) + localPy;
+            const tplX = globalX - startGlobalX; // template-local X
+            const tplY = globalY - startGlobalY; // template-local Y
+            if (Number.isFinite(tplX) && Number.isFinite(tplY)) {
+              pairs.push({ date, "Tl X": TlX, "Tl Y": TlY, "Px X": tplX, "Px Y": tplY });
             }
           }
-          if (pairs.length) {
-            const idPart = tplId ? String(tplId) : encodeURIComponent(this.templateName);
-            const fileName = `${idPart}.jsonl`;
-            const filePath = path.join(heatMapsDir, fileName);
-            // ensure file exists
-            try { if (!existsSync(filePath)) writeFileSync(filePath, ""); } catch (_) { }
-            // append as JSONL to avoid memory usage
-            const lines = pairs.map(o => JSON.stringify(o)).join("\n") + "\n";
-            appendFileSync(filePath, lines);
-            // enforce limit by truncating oldest when exceeding lines
-            try {
-              const limit = Math.max(0, Math.floor(Number(tpl.heatmapLimit || 10000))) || 10000;
-              if (limit > 0) {
-                const raw = readFileSync(filePath, "utf8");
-                const arr = raw.split(/\r?\n/).filter(Boolean);
-                if (arr.length > limit) {
-                  const keep = arr.slice(arr.length - limit);
-                  writeFileSync(filePath, keep.join("\n") + "\n");
-                }
-              }
-            } catch (_) { }
-          }
         }
-      } catch (_) { }
-      return { painted: body.colors.length, success: true };
+        if (pairs.length) {
+          const idPart = tplId ? String(tplId) : encodeURIComponent(this.templateName);
+          const fileName = `${idPart}.jsonl`;
+          const filePath = path.join(heatMapsDir, fileName);
+          // ensure file exists
+          try { if (!existsSync(filePath)) writeFileSync(filePath, ""); } catch (_) { }
+          // append as JSONL to avoid memory usage
+          const lines = pairs.map(o => JSON.stringify(o)).join("\n") + "\n";
+          appendFileSync(filePath, lines);
+          // enforce limit by truncating oldest when exceeding lines
+          try {
+            const limit = Math.max(0, Math.floor(Number(tpl.heatmapLimit || 10000))) || 10000;
+            if (limit > 0) {
+              const raw = readFileSync(filePath, "utf8");
+              const arr = raw.split(/\r?\n/).filter(Boolean);
+              if (arr.length > limit) {
+                const keep = arr.slice(arr.length - limit);
+                writeFileSync(filePath, keep.join("\n") + "\n");
+              }
+            }
+          } catch (_) { }
+        }
+      }
+    } catch (_) { }
+    return { painted: body.colors.length, success: true };
     } else if (response.status === 401 || response.status === 403) {
       // Authentication expired - mark for cookie refresh
       return { painted: 0, success: false, reason: "auth_expired" };
@@ -1695,8 +1744,8 @@ class WPlacer {
       for (const tileKey in bodiesByTile) {
         if (this._isCancelled()) { needsRetry = false; break; }
         const [tx, ty] = tileKey.split(",").map(Number);
-        const body = { ...bodiesByTile[tileKey], t: this.token };
-        if (globalThis.__wplacer_last_fp) body.fp = globalThis.__wplacer_last_fp;
+        const body = { ...bodiesByTile[tileKey]};
+        body.fp = await this.fp();
         const result = await this._executePaint(tx, ty, body);
         if (result.success) {
           totalPainted += result.painted;
@@ -1723,7 +1772,7 @@ class WPlacer {
     const body = { product: { id: productId, amount } };
     if (typeof variant === "number") body.product.variant = variant;
 
-    const response = await this.post(`https://bplace.org/purchase`, body);
+    const response = await this.post(`https://backend.wplace.live/purchase`, body);
 
     if (response.status === 200 && response.data && response.data.success === true) {
       let msg = `🛒 Purchase successful for product #${productId} (amount: ${amount})`;
@@ -1750,7 +1799,7 @@ class WPlacer {
 
   async equipFlag(flagId) {
     const id = Number(flagId) || 0;
-    const url = `https://bplace.org/flag/equip/${id}`;
+    const url = `https://backend.wplace.live/flag/equip/${id}`;
     const res = await this.post(url, {});
     if (res.status === 200 && res.data && res.data.success === true) {
       if (id === 0) {
@@ -1881,6 +1930,14 @@ const saveJSON = (filename, data) => writeFileSync(path.join(dataDir, filename),
 
 const users = loadJSON("users.json");
 const saveUsers = () => saveJSON("users.json", users);
+
+// Auto-generate fp for existing users who don't have one
+for (const userId in users) {
+  if (users[userId] && !users[userId].fp) {
+    users[userId].fp = crypto.randomUUID().replace(/-/g, "");
+  }
+}
+saveUsers();
 
 // Active TemplateManagers (in-memory)
 const templates = {};
@@ -3185,7 +3242,8 @@ app.post("/user", async (req, res) => {
       ...prev,
       name: userInfo.name,
       cookies: req.body.cookies,
-      expirationDate: exp || prev?.expirationDate || null
+      expirationDate: exp || prev?.expirationDate || null,
+      fp: prev?.fp || crypto.randomUUID().replace(/-/g, "")
     };
     if (shortLabelFromProfile) {
       users[userInfo.id].shortLabel = shortLabelFromProfile;
@@ -3345,7 +3403,7 @@ app.put("/user/:id/update-profile", async (req, res) => {
     await wplacer.login(users[id].cookies);
     const payload = { name, discord, showLastPixel };
 
-    const { status, data } = await wplacer.post("https://bplace.org/me/update", payload);
+    const { status, data } = await wplacer.post("https://backend.wplace.live/me/update", payload);
     if (status === 200 && data && data.success) {
       if (typeof name === "string" && name.length) { users[id].name = name; }
       users[id].discord = discord;
@@ -3362,6 +3420,18 @@ app.put("/user/:id/update-profile", async (req, res) => {
   } finally {
     activeBrowserUsers.delete(id);
   }
+});
+
+// --- API: reset user fingerprint ---
+app.post("/user/:id/reset-fp", (req, res) => {
+  const { id } = req.params;
+  if (!users[id]) return res.status(404).json({ error: "User not found" });
+  
+  const newFp = crypto.randomUUID().replace(/-/g, "");
+  users[id].fp = newFp;
+  saveUsers();
+  
+  res.json({ success: true, newFp });
 });
 
 // Open local Brave profile launcher (.bat) by user's shortLabel
@@ -3430,12 +3500,12 @@ app.post("/user/:id/alliance/join", async (req, res) => {
   const wplacer = new WPlacer();
   try {
     await wplacer.login(users[id].cookies);
-    const url = `https://bplace.org/alliance/join/${encodeURIComponent(uuid.trim())}`;
+    const url = `https://backend.wplace.live/alliance/join/${encodeURIComponent(uuid.trim())}`;
     const response = await wplacer.browser.fetch(url, {
       method: "GET",
       headers: {
         Accept: "text/html,application/json,*/\*",
-        Referer: "https://bplace.org/"
+        Referer: "https://backend.wplace.live/"
       },
       redirect: "manual"
     });
@@ -3470,12 +3540,12 @@ app.post("/user/:id/alliance/leave", async (req, res) => {
   const wplacer = new WPlacer();
   try {
     await wplacer.login(users[id].cookies);
-    const url = `https://bplace.org/alliance/leave`;
+    const url = `https://backend.wplace.live/alliance/leave`;
     const response = await wplacer.browser.fetch(url, {
       method: "POST",
       headers: {
         Accept: "*/*",
-        Referer: "https://bplace.org/"
+        Referer: "https://backend.wplace.live/"
       }
     });
     const status = response.status | 0;
@@ -4563,8 +4633,8 @@ app.get("/test-proxies", async (req, res) => {
     const target = String(req.query.target || "tile").toLowerCase();
     const isMe = target === "me";
     const targetUrl = isMe
-      ? "https://bplace.org/me"
-      : String(req.query.url || "https://bplace.org/files/s0/tiles/0/0.png");
+      ? "https://backend.wplace.live/me"
+      : String(req.query.url || "https://backend.wplace.live/files/s0/tiles/0/0.png");
 
     const toTest = loadedProxies.map((p, i) => ({
       idx: Number(p._idx) || (i + 1),
@@ -4605,15 +4675,15 @@ app.get("/test-proxies", async (req, res) => {
                 ? {
                   Accept: "application/json, text/plain, */*",
                   "X-Requested-With": "XMLHttpRequest",
-                  Referer: "https://bplace.org/",
-                  Origin: "https://bplace.org",
+                  Referer: "https://backend.wplace.live/",
+                  Origin: "https://backend.wplace.live",
                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
                   "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
                   "Sec-Fetch-Dest": "empty",
                   "Sec-Fetch-Mode": "cors",
                   "Sec-Fetch-Site": "same-site"
                 }
-                : { Accept: "image/*", Referer: "https://bplace.org/" },
+                : { Accept: "image/*", Referer: "https://backend.wplace.live/" },
               redirect: "manual",
               signal: controller.signal
             });
@@ -4700,7 +4770,7 @@ app.get("/test-proxy", async (req, res) => {
     const idx = Math.max(1, parseInt(String(req.query.idx || "0"), 10) || 0);
     const target = String(req.query.target || "me").toLowerCase();
     const isMe = target === "me";
-    const targetUrl = isMe ? "https://bplace.org/me" : "https://bplace.org/files/s0/tiles/0/0.png";
+    const targetUrl = isMe ? "https://backend.wplace.live/me" : "https://backend.wplace.live/files/s0/tiles/0/0.png";
 
     const p = loadedProxies.find((x, i) => Number(x._idx) === idx) || loadedProxies[idx - 1];
     if (!p) return res.status(404).json({ error: "proxy_not_found" });
@@ -4727,15 +4797,15 @@ app.get("/test-proxy", async (req, res) => {
             ? {
               Accept: "application/json, text/plain, */*",
               "X-Requested-With": "XMLHttpRequest",
-              Referer: "https://bplace.org/",
-              Origin: "https://bplace.org",
+              Referer: "https://backend.wplace.live/",
+              Origin: "https://backend.wplace.live",
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
               "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
               "Sec-Fetch-Dest": "empty",
               "Sec-Fetch-Mode": "cors",
               "Sec-Fetch-Site": "same-site"
             }
-            : { Accept: "image/*", Referer: "https://bplace.org/" },
+            : { Accept: "image/*", Referer: "https://backend.wplace.live/" },
           redirect: "manual",
           signal: controller.signal
         });
@@ -4883,7 +4953,7 @@ app.get("/canvas", async (req, res) => {
   const { tx, ty } = req.query;
   if (isNaN(parseInt(tx)) || isNaN(parseInt(ty))) return res.sendStatus(400);
   try {
-    const url = `https://bplace.org/files/s0/tiles/${tx}/${ty}.png`;
+    const url = `https://backend.wplace.live/files/s0/tiles/${tx}/${ty}.png`;
     let buffer;
 
     const useProxy = !!currentSettings.proxyEnabled && loadedProxies.length > 0;
@@ -5261,3 +5331,4 @@ app.get('/export-tokens', (req, res) => {
     process.on('SIGTERM', shutdown);
   } catch (_) { }
 })();
+
