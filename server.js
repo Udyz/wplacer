@@ -332,7 +332,7 @@ async function checkGriefersInTemplate(templateId, templateData, sampleLimit = 1
           name: user.name,
           id: user.id,
           alliance: user.allianceName || '-',
-          url: `https://backend.wplace.live/?lat=${lat}&lng=${lon}&zoom=${zoom}`,
+          url: `https://wplace.live/?lat=${lat}&lng=${lon}&zoom=${zoom}`,
           lat: lat,
           lng: lon, // Keep lng for frontend compatibility
           griefType: mismatch.griefType,
@@ -5333,5 +5333,6 @@ app.get('/export-tokens', (req, res) => {
     process.on('SIGTERM', shutdown);
   } catch (_) { }
 })();
+
 
 
