@@ -827,7 +827,7 @@ class WPlacer {
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://backend.wplace.live/",
         "Origin": "https://backend.wplace.live",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", //replace user-agent with your browser user-agent that login to wplace
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
